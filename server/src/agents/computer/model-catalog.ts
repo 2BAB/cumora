@@ -136,6 +136,17 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     fastModelScope: 'agent',
     source: 'presets',
   },
+  maka: {
+    // Maka resolves models against the operator's configured provider profiles
+    // in ~/.maka/config.json; supportsCustom lets an agent pin any model id
+    // its local Maka runtime accepts.
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
 }
 
 const MODEL_PROBE_TIMEOUT_MS = 10_000

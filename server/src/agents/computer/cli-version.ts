@@ -130,6 +130,11 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
   zcode: {
     versionArgs: ['--version'],
   },
+  maka: {
+    versionArgs: ['--version'],
+    npm: 'maka-agent',
+    selfUpdate: 'maka update',
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',

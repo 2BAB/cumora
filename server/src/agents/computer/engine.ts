@@ -401,10 +401,10 @@ export async function loginCodexRuntime(): Promise<void> {
   })
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -3094,6 +3094,12 @@ class AcpRpcConnection {
     })
   }
 
+  /** Reply to a server→client JSON-RPC request (e.g. session/request_permission). */
+  reply(id: number | string, result: unknown): void {
+    if (this.dead || this.stopRequested) return
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+  }
+
   stop(options: { force?: boolean } = {}): Promise<void> {
     this.stopRequested = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
@@ -3134,7 +3140,7 @@ class AcpRpcConnection {
       let msg: AcpMsg | null = null
       try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
       if (!msg) { const c = cleanLine(line); if (c) this.hooks.onLog(c); continue }
-      if (msg.id !== undefined) {
+      if (msg.id !== undefined && !msg.method) {
         const waiter = this.waiters.get(msg.id)
         if (waiter) { this.waiters.delete(msg.id); waiter(msg); continue }
       }
@@ -3417,6 +3423,346 @@ class ZcodeAdapter implements EngineAdapter {
         ? 'aborted (timeout)'
         : err instanceof Error ? err.message : String(err)
       return { ok: false, detail: `zcode bridge handshake failed: ${why}`.slice(0, 240) }
+    } finally {
+      await session.stop({ force: true })
+    }
+  }
+}
+
+// ─── maka ─────────────────────────────────────────────────────────────────
+//
+// Apache Maka (the `maka` CLI, or its legacy `dsh` binary alias) ships a native
+// ACP v1 stdio server via `maka --acp`.
+//
+// Protocol lifecycle:
+//   1. `initialize` → `session/load` (falling back to `session/new` when the
+//      Runtime Host session was deleted/archived or does not match `cwd`)
+//   2. `session/set_config_option` (`permission_mode`: `bypass` for agent turns,
+//      `explore` for read-only triage/probe; plus `model` when configured)
+//   3. `session/prompt` per wake, streaming `session/update` notifications
+//      (`agent_message_chunk`, `tool_call`) and auto-answering any
+//      server-initiated `session/request_permission` requests.
+
+/** Resolve the Maka CLI binary (`CUMORA_MAKA_BIN` override, then `maka` or
+ *  legacy `dsh` on `env.PATH`). */
+function resolveMakaBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.CUMORA_MAKA_BIN?.trim()
+  if (explicit) return explicit
+  for (const name of ['maka', 'dsh']) {
+    for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+      if (!dir) continue
+      const candidate = join(dir, IS_WIN ? `${name}.cmd` : name)
+      if (existsSync(candidate)) return candidate
+      if (IS_WIN && existsSync(join(dir, `${name}.exe`))) return join(dir, `${name}.exe`)
+      if (IS_WIN && existsSync(join(dir, name))) return join(dir, name)
+    }
+  }
+  return null
+}
+
+/** Locate the `maka --acp` spawn command on this machine. */
+function resolveMakaAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: string[]; shell: boolean } {
+  const explicit = env.CUMORA_MAKA_BIN?.trim()
+  if (explicit) {
+    if (/\.[cm]?js$/i.test(explicit)) return { command: process.execPath, args: [explicit, '--acp'], shell: false }
+    const sp = resolveSpawn(explicit)
+    return { command: sp.command, args: ['--acp'], shell: sp.shell }
+  }
+  const sp = resolveSpawn(resolveMakaBin(env) ?? 'maka')
+  return { command: sp.command, args: ['--acp'], shell: sp.shell }
+}
+
+interface MakaTurnOptions {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  prompt: string
+  model?: string | null
+  permissionMode?: 'bypass' | 'explore'
+  signal: AbortSignal
+  onLog?: (line: string) => void
+  onHopUsage?: (r: EngineHopReport) => void
+}
+
+interface MakaSessionOptions extends EngineSessionArgs {
+  permissionMode?: 'bypass' | 'explore'
+  onAgentText?: (text: string) => void
+  signal?: AbortSignal
+}
+
+const MAKA_MISSING_SESSION_RE =
+  /runtime host session was not found|archived runtime host sessions cannot be loaded|session is not owned by this acp connection|session is not active|no such session|unknown session/i
+
+class MakaSession implements EngineSession {
+  readonly carriesStandingPrompt = false
+
+  private readonly conn: AcpRpcConnection
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private readonly onAgentText?: (text: string) => void
+  private readonly model: string | null
+  private readonly permissionMode: 'bypass' | 'explore'
+  private permissionModeUnapplied = true
+  private modelUnapplied: boolean
+  private turn: { resolve: (r: EngineRunResult) => void } | null = null
+  private promptInFlight = false
+  private steerWarned = false
+  private stopped = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: MakaSessionOptions) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.onAgentText = opts.onAgentText
+    this.model = opts.model ?? null
+    this.permissionMode = opts.permissionMode ?? 'bypass'
+    this.modelUnapplied = !!opts.model
+    this.conn = new AcpRpcConnection(
+      resolveMakaAcpSpawn(env),
+      home,
+      env,
+      opts.resumeSessionId ?? null,
+      () => ({ cwd: home, mcpServers: [] }),
+      {
+        onLog: (line) => this.onLog(line),
+        onNotification: (msg) => this.onUpdate(msg),
+        onDeath: (code, why) => this.onDeath(code, why),
+        onLoadFallback: (why) => {
+          this.onLog(`[maka] session/load failed (${why}) — starting a fresh session`)
+        },
+      },
+      opts.signal,
+    )
+  }
+
+  get alive(): boolean { return this.conn.alive }
+  get sessionId(): string | null { return this.conn.sid }
+  whenReady(): Promise<void> { return this.conn.ready }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.turn) return classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.conn.sid }, this.conn.resumed)
+    if (!this.alive) return classifyEngineResult({ exitCode: this.conn.exitStatusCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.conn.sid }, this.conn.resumed)
+    let resolveTurn!: (r: EngineRunResult) => void
+    const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
+    let settled = false
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    this.turn = { resolve: settle }
+    try {
+      await this.conn.ready
+      await this.applySessionConfig()
+      if (!this.alive) throw new Error('engine session is not alive (process gone)')
+      const wasResume = this.conn.resumed
+      const startedAt = Date.now()
+      this.promptInFlight = true
+      const resp = await this.conn.rpc('session/prompt', {
+        sessionId: this.conn.sid,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+      })
+      this.conn.resumed = false
+      const usage = extractAcpUsage(resp.result) ?? undefined
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model: this.model ?? 'maka',
+            usage: usage ?? {},
+            latencyMs: Date.now() - startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model: this.model }, wasResume))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const wasResume = this.conn.resumed
+      this.conn.resumed = false
+      settle(this.failureResult(message, wasResume, this.conn.exitStatusCode || 1))
+    } finally {
+      this.promptInFlight = false
+    }
+    return done
+  }
+
+  steer(_text: string): void {
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.log('[maka] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  async stop(options: { force?: boolean } = {}): Promise<void> {
+    this.stopped = true
+    await this.conn.stop(options)
+  }
+
+  private async applySessionConfig(): Promise<void> {
+    if (!this.conn.sid) return
+    if (this.permissionModeUnapplied) {
+      try {
+        await this.conn.rpc('session/set_config_option', {
+          sessionId: this.conn.sid,
+          configId: 'permission_mode',
+          value: this.permissionMode,
+        })
+        this.permissionModeUnapplied = false
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        this.log(`[maka] permission_mode pin rejected (${why}) — continuing`)
+      }
+    }
+    if (this.modelUnapplied && this.model) {
+      try {
+        await this.conn.rpc('session/set_config_option', {
+          sessionId: this.conn.sid,
+          configId: 'model',
+          value: this.model,
+        })
+        this.modelUnapplied = false
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        this.log(`[maka] model pin rejected (${why}) — continuing on the engine default`)
+      }
+    }
+  }
+
+  private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    return classifyEngineResult({
+      exitCode,
+      error: message,
+      failure: wasResume && MAKA_MISSING_SESSION_RE.test(message)
+        ? { kind: 'resume-not-found', message, diagnostic: message }
+        : undefined,
+      sessionId: this.conn.sid,
+    }, wasResume)
+  }
+
+  private onDeath(code: number, why: string): void {
+    if (!this.stopped) {
+      this.log(`[session] engine process died ${this.turn ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    const wasResume = this.conn.resumed
+    this.conn.resumed = false
+    this.turn?.resolve(this.failureResult(why, wasResume, code))
+  }
+
+  private onUpdate(msg: AcpMsg): void {
+    if (msg.method === 'session/request_permission' && msg.id !== undefined) {
+      const options = Array.isArray(msg.params?.options)
+        ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
+        : []
+      const preferred = this.permissionMode === 'explore'
+        ? options.find((o) => o?.kind === 'reject_once' || o?.kind === 'reject_always')
+        : (options.find((o) => o?.kind === 'allow_always') ?? options.find((o) => o?.kind === 'allow_once') ?? options[0])
+      const optionId = typeof preferred?.optionId === 'string' && preferred.optionId
+        ? preferred.optionId
+        : (this.permissionMode === 'explore' ? 'reject_once' : 'allow_once')
+      this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId } })
+      return
+    }
+    if (msg.method !== 'session/update' || !this.promptInFlight) return
+    const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+    const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+    if (kind === 'tool_call' && typeof u?.title === 'string') {
+      this.log(`[maka] tool ${u.title}`)
+    } else if (kind === 'agent_message_chunk') {
+      const content = u?.content as { text?: unknown } | undefined
+      if (typeof content?.text === 'string' && content.text) {
+        this.onAgentText?.(content.text)
+        if (content.text.trim()) this.log(`[maka] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+      }
+    }
+  }
+
+  private log(line: string): void { this.onLog(line) }
+}
+
+async function runMakaAcpTurn(opts: MakaTurnOptions): Promise<EngineRunResult & { text: string }> {
+  const chunks: string[] = []
+  const session = new MakaSession(opts.cwd, opts.env, {
+    home: opts.cwd,
+    env: opts.env,
+    model: opts.model,
+    permissionMode: opts.permissionMode,
+    standingPrompt: null,
+    resumeSessionId: null,
+    onLog: opts.onLog ?? (() => {}),
+    onHopUsage: opts.onHopUsage,
+    onAgentText: (text) => chunks.push(text),
+    signal: opts.signal,
+  })
+  try {
+    return { ...await session.send(opts.prompt), text: chunks.join('') }
+  } finally {
+    await session.stop({ force: true })
+  }
+}
+
+class MakaAdapter implements EngineAdapter {
+  readonly id = 'maka' as const
+  readonly bin = 'maka'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await atomicAgentWrite(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
+    )
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    return runMakaAcpTurn({
+      cwd: args.home,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      permissionMode: 'bypass',
+      signal: args.signal,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return new MakaSession(args.home, args.env, args)
+  }
+
+  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    return runMakaAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      permissionMode: 'explore',
+      signal: args.signal,
+      onLog: args.onLog,
+    })
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    return runMakaAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: DOCTOR_PROMPT,
+      permissionMode: 'explore',
+      signal: args.signal,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    const session = new MakaSession(args.cwd, args.env, {
+      home: args.cwd,
+      env: args.env,
+      standingPrompt: null,
+      resumeSessionId: null,
+      onLog: () => {},
+      signal: args.signal,
+    })
+    try {
+      await session.whenReady()
+      return { ok: true, detail: '' }
+    } catch (err) {
+      const why = args.signal.aborted
+        ? 'aborted (timeout)'
+        : err instanceof Error ? err.message : String(err)
+      return { ok: false, detail: `maka acp handshake failed: ${why}`.slice(0, 240) }
     } finally {
       await session.stop({ force: true })
     }
@@ -5840,6 +6186,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   qwen: new QwenAdapter(),
   antigravity: new AntigravityAdapter(),
   zcode: new ZcodeAdapter(),
+  maka: new MakaAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -5859,7 +6206,9 @@ export async function detectEnginesWithStatus(): Promise<EngineDetection> {
   const ids = Object.keys(ADAPTERS) as EngineId[]
   const probes = await Promise.all(ids.map(async (id) => {
     const status = await probeBinOnPath(ADAPTERS[id].bin)
-    const installed = status === 'present' || (id === 'grok' && resolveGrokBin() != null)
+    const installed = status === 'present'
+      || (id === 'grok' && resolveGrokBin() != null)
+      || (id === 'maka' && resolveMakaBin() != null)
     return { id, installed, status }
   }))
   return {
@@ -5902,7 +6251,9 @@ export async function snapshotDetectedEngines(ids?: readonly EngineId[]): Promis
     const bin = ADAPTERS[id].bin
     const path = id === 'grok'
       ? (resolveGrokBin() ?? await resolveBinPath(bin))
-      : await resolveBinPath(bin)
+      : id === 'maka'
+        ? (resolveMakaBin() ?? await resolveBinPath(bin))
+        : await resolveBinPath(bin)
     return { id, bin, path }
   }))
 }
@@ -6030,7 +6381,8 @@ export async function runEngineDoctor(opts?: {
   const ids = opts?.engines ?? Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
-    const path = (await resolveBinPath(adapter.bin)) ?? (id === 'grok' ? resolveGrokBin(env) : null)
+    const path = (await resolveBinPath(adapter.bin))
+      ?? (id === 'grok' ? resolveGrokBin(env) : id === 'maka' ? resolveMakaBin(env) : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()
