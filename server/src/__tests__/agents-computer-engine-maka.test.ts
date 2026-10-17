@@ -1,10 +1,10 @@
 /** Contract tests for the BYOA Maka (`maka --acp`) ACP adapter. */
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
-import { getAdapter, type EngineHopReport } from '../agents/computer/engine.js'
+import { getAdapter, resolveMakaBin, type EngineHopReport } from '../agents/computer/engine.js'
 
 const tempDirs: string[] = []
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
@@ -23,9 +23,37 @@ if (argv.length !== 1 || argv[0] !== '--acp') {
 
 let prompts = 0
 let permissionReply = null
+let pendingPrompt = null
 const send = (obj) => process.stdout.write(JSON.stringify(obj) + '\n')
 const record = (entry) => {
   if (logFile) appendFileSync(logFile, JSON.stringify(entry) + '\n')
+}
+const finishPrompt = (id, sid) => {
+  send({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'tc-1', title: 'Read README.md' } },
+  })
+  send({
+    jsonrpc: '2.0',
+    method: 'session/update',
+    params: {
+      sessionId: sid,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'pong #' + prompts } },
+    },
+  })
+  send({
+    jsonrpc: '2.0',
+    id,
+    result: mode === 'with-usage'
+      ? {
+          stopReason: 'end_turn',
+          usage: { inputTokens: 100, inputTokenDetails: { cacheReadTokens: 25, cacheWriteTokens: 5 }, outputTokens: 12 },
+        }
+      : {
+          stopReason: 'end_turn',
+        },
+  })
 }
 
 const rl = createInterface({ input: process.stdin })
@@ -34,13 +62,18 @@ rl.on('line', (line) => {
   record(msg)
   if (msg.id !== undefined && !msg.method) {
     permissionReply = msg.result
+    if (pendingPrompt) {
+      const { id, sid } = pendingPrompt
+      pendingPrompt = null
+      finishPrompt(id, sid)
+    }
     return
   }
   if (msg.method === 'initialize') {
     send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } })
   } else if (msg.method === 'session/new') {
     send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'maka-sess-fresh', configOptions: [] } })
-  } else if (msg.method === 'session/load') {
+  } else if (msg.method === 'session/resume' || msg.method === 'session/load') {
     if (mode === 'fail-load') {
       send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'Runtime Host Session was not found.' } })
     } else {
@@ -54,7 +87,7 @@ rl.on('line', (line) => {
           },
         })
       }
-      send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
+      send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: msg.params.sessionId, configOptions: [] } })
     }
   } else if (msg.method === 'session/set_config_option') {
     if (msg.params?.configId !== 'permission_mode' || !['ask', 'bypass'].includes(msg.params?.value)) {
@@ -69,6 +102,10 @@ rl.on('line', (line) => {
     }
     if (mode === 'session-gone') {
       send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'Session is not owned by this ACP connection' } })
+      return
+    }
+    if (mode === 'cwd-mismatch') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'cwd does not match the existing session workspace' } })
       return
     }
     if (mode === 'cancelled') {
@@ -91,6 +128,20 @@ rl.on('line', (line) => {
           options: [
             { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
             { optionId: 'allow_always', name: 'Always allow', kind: 'allow_always' },
+            { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+          ],
+        },
+      })
+    }
+    if (mode === 'ask-permission-reject-only') {
+      send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'session/request_permission',
+        params: {
+          sessionId: msg.params.sessionId,
+          toolCall: { toolCallId: 'tc-perm', title: 'Write file' },
+          options: [
             { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
           ],
         },
@@ -214,7 +265,7 @@ test('maka persistent session pins permission_mode=bypass once across wakes and 
   )
 })
 
-test('maka ignores replayed session/update notifications emitted during session/load', async () => {
+test('maka uses session/resume when resumeSessionId is supplied and ignores non-turn session/update notifications', async () => {
   const f = await makeFixture('replay-on-load')
   const logs: string[] = []
   const session = getAdapter('maka').startSession?.({
@@ -227,14 +278,17 @@ test('maka ignores replayed session/update notifications emitted during session/
   assert.ok(session)
   liveSessions.push(session)
 
-  const r = await session.send('wake after load')
+  const r = await session.send('wake after resume')
   assert.equal(r.exitCode, 0)
   assert.equal(r.sessionId, 'maka-sess-existing')
-  assert.ok(!logs.some((l) => l.includes('STALE_REPLAY_TEXT')), 'replayed load chunks must not leak into new turn logs')
+  assert.ok(!logs.some((l) => l.includes('STALE_REPLAY_TEXT')), 'non-turn chunks must not leak into new turn logs')
   assert.ok(logs.some((l) => l.includes('pong #1')))
+
+  const calls = await f.readCalls()
+  assert.deepEqual(calls.slice(0, 2).map((c) => c.method), ['initialize', 'session/resume'])
 })
 
-test('maka auto-answers server-initiated session/request_permission requests without colliding with client waiters', async () => {
+test('maka auto-answers server-initiated session/request_permission requests and cancels when no allow option exists', async () => {
   const f = await makeFixture('ask-permission')
   const session = getAdapter('maka').startSession?.({
     home: f.home,
@@ -252,7 +306,27 @@ test('maka auto-answers server-initiated session/request_permission requests wit
   const calls = await f.readCalls()
   const reply = calls.find((c) => c.id === 1 && !c.method)
   assert.deepEqual(reply?.result, {
-    outcome: { outcome: 'selected', optionId: 'allow_always' },
+    outcome: { outcome: 'selected', optionId: '550e8400-e29b-41d4-a716-446655440002' },
+  })
+
+  const fRejectOnly = await makeFixture('ask-permission-reject-only')
+  const sessionRejectOnly = getAdapter('maka').startSession?.({
+    home: fRejectOnly.home,
+    env: fRejectOnly.env,
+    standingPrompt: null,
+    resumeSessionId: null,
+    onLog: () => {},
+  })
+  assert.ok(sessionRejectOnly)
+  liveSessions.push(sessionRejectOnly)
+
+  const r2 = await sessionRejectOnly.send('permission options lack allow')
+  assert.equal(r2.exitCode, 0)
+
+  const callsRejectOnly = await fRejectOnly.readCalls()
+  const replyRejectOnly = callsRejectOnly.find((c) => c.id === 1 && !c.method)
+  assert.deepEqual(replyRejectOnly?.result, {
+    outcome: { outcome: 'cancelled' },
   })
 })
 
@@ -276,7 +350,7 @@ test('maka treats stopReason=cancelled as a failed turn instead of success', asy
   assert.equal(hops.length, 0)
 })
 
-test('maka self-heals a stale resume at load time and reports a fresh session', async () => {
+test('maka self-heals a stale resume at handshake time via session/resume -> session/new and reports a fresh session', async () => {
   const f = await makeFixture('fail-load')
   const logs: string[] = []
   const session = getAdapter('maka').startSession?.({
@@ -292,13 +366,13 @@ test('maka self-heals a stale resume at load time and reports a fresh session', 
   const r = await session.send('after stale resume')
   assert.equal(r.exitCode, 0)
   assert.equal(r.sessionId, 'maka-sess-fresh')
-  assert.ok(logs.some((l) => l.includes('session/load failed') && l.includes('fresh session')))
+  assert.ok(logs.some((l) => l.includes('session/resume failed') && l.includes('fresh session')))
 
   const calls = await f.readCalls()
-  assert.deepEqual(calls.slice(0, 3).map((c) => c.method), ['initialize', 'session/load', 'session/new'])
+  assert.deepEqual(calls.slice(0, 3).map((c) => c.method), ['initialize', 'session/resume', 'session/new'])
 })
 
-test('maka maps a mid-life missing Runtime Host session to resume-not-found', async () => {
+test('maka maps mid-life missing or cwd-mismatched Runtime Host sessions to resume-not-found', async () => {
   const f = await makeFixture('session-gone')
   const session = getAdapter('maka').startSession?.({
     home: f.home,
@@ -313,6 +387,21 @@ test('maka maps a mid-life missing Runtime Host session to resume-not-found', as
   const r = await session.send('turn on dead backend session')
   assert.equal(r.exitCode, 1)
   assert.equal(r.failure?.kind, 'resume-not-found')
+
+  const fCwd = await makeFixture('cwd-mismatch')
+  const sessionCwd = getAdapter('maka').startSession?.({
+    home: fCwd.home,
+    env: fCwd.env,
+    standingPrompt: null,
+    resumeSessionId: 'maka-sess-cwd',
+    onLog: () => {},
+  })
+  assert.ok(sessionCwd)
+  liveSessions.push(sessionCwd)
+
+  const rCwd = await sessionCwd.send('turn on mismatched workspace')
+  assert.equal(rCwd.exitCode, 1)
+  assert.equal(rCwd.failure?.kind, 'resume-not-found')
 })
 
 test('maka process dying MID-TURN resolves the turn as a failure, never rejects', async () => {
@@ -362,7 +451,7 @@ test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use 
   assert.equal(permCfg?.params?.value, 'bypass')
 })
 
-test('maka probeWake exercises the acp handshake and one-shot run returns text', async () => {
+test('maka probeWake exercises the acp handshake and one-shot run forwards resumeSessionId', async () => {
   const f = await makeFixture()
   const adapter = getAdapter('maka')
   const controller = new AbortController()
@@ -374,12 +463,40 @@ test('maka probeWake exercises the acp handshake and one-shot run returns text',
     home: f.home,
     env: f.env,
     prompt: 'say pong',
+    resumeSessionId: 'maka-sess-resumed-run',
     signal: controller.signal,
     onLog: () => {},
   })
   assert.equal(oneShot.exitCode, 0)
-  assert.equal(oneShot.sessionId, 'maka-sess-fresh')
+  assert.equal(oneShot.sessionId, 'maka-sess-resumed-run')
+
+  const calls = await f.readCalls()
+  assert.ok(
+    calls.some((c) => c.method === 'session/resume' && c.params?.sessionId === 'maka-sess-resumed-run'),
+    'MakaAdapter.run must forward resumeSessionId to session/resume',
+  )
 
   const probed = await adapter.probe({ cwd: f.home, env: f.env, tier: 'big', signal: controller.signal })
   assert.equal(probed.text, 'pong #1')
+})
+
+test('maka does not fall back to dsh when only dsh is on PATH', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-maka-dsh-only-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  await mkdir(binDir, { recursive: true })
+  const dshBin = join(binDir, process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
+  await writeFile(dshBin, '#!/bin/sh\nexit 0\n', 'utf8')
+  await chmod(dshBin, 0o755)
+
+  const envWithOnlyDsh: NodeJS.ProcessEnv = { PATH: binDir }
+  assert.equal(resolveMakaBin(envWithOnlyDsh), null)
+
+  const controller = new AbortController()
+  const wake = await getAdapter('maka').probeWake({
+    cwd: root,
+    env: envWithOnlyDsh,
+    signal: controller.signal,
+  })
+  assert.equal(wake.ok, false)
 })

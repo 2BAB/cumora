@@ -3048,6 +3048,7 @@ class AcpRpcConnection {
     sessionParams: () => Record<string, unknown>,
     hooks: AcpRpcConnectionHooks,
     signal?: AbortSignal,
+    private readonly attachMethod: 'session/load' | 'session/resume' = 'session/load',
   ) {
     this.child = spawnEngineChild(spawnSpec.command, spawnSpec.args, {
       cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: spawnSpec.shell,
@@ -3106,7 +3107,7 @@ class AcpRpcConnection {
     return terminateEngineTree(this.child, options.force)
   }
 
-  /** initialize → session/load|new. A stale resume falls back to a fresh
+  /** initialize → session/load|resume|new. A stale resume falls back to a fresh
    *  session; anything else rejects `ready` and fails the pending turn. */
   private async handshake(): Promise<void> {
     await this.rpc('initialize', {
@@ -3116,7 +3117,7 @@ class AcpRpcConnection {
     })
     if (this.sid) {
       try {
-        this.absorbSessionId(await this.rpc('session/load', { sessionId: this.sid, ...this.sessionParams() }))
+        this.absorbSessionId(await this.rpc(this.attachMethod, { sessionId: this.sid, ...this.sessionParams() }))
         this.resumed = true
         return
       } catch (err) {
@@ -3431,21 +3432,18 @@ class ZcodeAdapter implements EngineAdapter {
 
 // ─── maka ─────────────────────────────────────────────────────────────────
 // Apache Maka (`maka --acp`) ACP v1 persistent session: initialize →
-// session/load (fallback session/new) → permission_mode=bypass → session/prompt.
+// session/resume (fallback session/new) → permission_mode=bypass → session/prompt.
 
-/** Resolve the Maka CLI binary (`CUMORA_MAKA_BIN` override, then `maka` or
- *  legacy `dsh` on `env.PATH`). */
-function resolveMakaBin(env: NodeJS.ProcessEnv = process.env): string | null {
+/** Resolve `CUMORA_MAKA_BIN` or `maka` on `env.PATH`. */
+export function resolveMakaBin(env: NodeJS.ProcessEnv = process.env): string | null {
   const explicit = env.CUMORA_MAKA_BIN?.trim()
   if (explicit) return explicit
-  for (const name of ['maka', 'dsh']) {
-    for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
-      if (!dir) continue
-      const candidate = join(dir, IS_WIN ? `${name}.cmd` : name)
-      if (existsSync(candidate)) return candidate
-      if (IS_WIN && existsSync(join(dir, `${name}.exe`))) return join(dir, `${name}.exe`)
-      if (IS_WIN && existsSync(join(dir, name))) return join(dir, name)
-    }
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'maka.cmd' : 'maka')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'maka.exe'))) return join(dir, 'maka.exe')
+    if (IS_WIN && existsSync(join(dir, 'maka'))) return join(dir, 'maka')
   }
   return null
 }
@@ -3467,6 +3465,7 @@ interface MakaTurnOptions {
   env: NodeJS.ProcessEnv
   prompt: string
   model?: string | null
+  resumeSessionId?: string | null
   signal: AbortSignal
   onLog?: (line: string) => void
   onHopUsage?: (r: EngineHopReport) => void
@@ -3478,7 +3477,7 @@ interface MakaSessionOptions extends EngineSessionArgs {
 }
 
 const MAKA_MISSING_SESSION_RE =
-  /runtime host session was not found|archived runtime host sessions cannot be loaded|session is not owned by this acp connection|session is not active|no such session|unknown session/i
+  /runtime host session was not found|archived runtime host sessions cannot be loaded|session is not owned by this acp connection|cwd does not match the existing session workspace/i
 
 class MakaSession implements EngineSession {
   readonly carriesStandingPrompt = false
@@ -3511,10 +3510,11 @@ class MakaSession implements EngineSession {
         onNotification: (msg) => this.onUpdate(msg),
         onDeath: (code, why) => this.onDeath(code, why),
         onLoadFallback: (why) => {
-          this.onLog(`[maka] session/load failed (${why}) — starting a fresh session`)
+          this.onLog(`[maka] session/resume failed (${why}) — starting a fresh session`)
         },
       },
       opts.signal,
+      'session/resume',
     )
   }
 
@@ -3630,11 +3630,11 @@ class MakaSession implements EngineSession {
         : []
       const preferred = options.find((o) => o?.kind === 'allow_always')
         ?? options.find((o) => o?.kind === 'allow_once')
-        ?? options[0]
-      const optionId = typeof preferred?.optionId === 'string' && preferred.optionId
-        ? preferred.optionId
-        : 'allow_once'
-      this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId } })
+      if (typeof preferred?.optionId === 'string' && preferred.optionId) {
+        this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId: preferred.optionId } })
+      } else {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+      }
       return
     }
     if (msg.method !== 'session/update' || !this.promptInFlight) return
@@ -3661,7 +3661,7 @@ async function runMakaAcpTurn(opts: MakaTurnOptions): Promise<EngineRunResult & 
     env: opts.env,
     model: opts.model,
     standingPrompt: null,
-    resumeSessionId: null,
+    resumeSessionId: opts.resumeSessionId ?? null,
     onLog: opts.onLog ?? (() => {}),
     onHopUsage: opts.onHopUsage,
     onAgentText: (text) => chunks.push(text),
@@ -3693,6 +3693,7 @@ class MakaAdapter implements EngineAdapter {
       env: args.env,
       prompt: args.prompt,
       model: args.model,
+      resumeSessionId: args.resumeSessionId,
       signal: args.signal,
       onLog: args.onLog,
       onHopUsage: args.onHopUsage,
