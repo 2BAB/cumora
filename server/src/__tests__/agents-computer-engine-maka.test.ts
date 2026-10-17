@@ -1,12 +1,4 @@
-/**
- * Contract tests for the BYOA Maka (`maka` / `dsh`) ACP adapter.
- *
- * The fake `maka --acp` server implements the ACP v1 stdio wire surface:
- *   initialize → session/new|load → session/set_config_option → session/prompt
- * plus `session/load` replay updates and `session/request_permission`.
- *
- * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-maka.test.ts
- */
+/** Contract tests for the BYOA Maka (`maka --acp`) ACP adapter. */
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -65,8 +57,8 @@ rl.on('line', (line) => {
       send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
     }
   } else if (msg.method === 'session/set_config_option') {
-    if (mode === 'reject-model' && msg.params?.configId === 'model') {
-      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Invalid ACP Session configuration configId' } })
+    if (msg.params?.configId !== 'permission_mode' || !['ask', 'bypass'].includes(msg.params?.value)) {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32602, message: 'Invalid params: Invalid Session configuration option' } })
     } else {
       send({ jsonrpc: '2.0', id: msg.id, result: { configOptions: [] } })
     }
@@ -77,6 +69,14 @@ rl.on('line', (line) => {
     }
     if (mode === 'session-gone') {
       send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'Session is not owned by this ACP connection' } })
+      return
+    }
+    if (mode === 'cancelled') {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: { stopReason: 'cancelled' },
+      })
       return
     }
     if (mode === 'ask-permission') {
@@ -156,7 +156,7 @@ afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((d) => rm(d, { recursive: true, force: true })))
 })
 
-test('maka persistent session pins permission_mode=bypass and model once across wakes', async () => {
+test('maka persistent session pins permission_mode=bypass once across wakes and ignores model pin', async () => {
   const f = await makeFixture()
   const logs: string[] = []
   const hops: EngineHopReport[] = []
@@ -179,10 +179,15 @@ test('maka persistent session pins permission_mode=bypass and model once across 
   assert.equal(r2.exitCode, 0)
   assert.equal(r1.sessionId, 'maka-sess-fresh')
   assert.equal(r2.sessionId, 'maka-sess-fresh')
+  assert.equal(r1.model, '<maka-default>')
   assert.equal(r1.usage?.input_tokens, 110)
   assert.equal(r1.usage?.output_tokens, 15)
   assert.equal(hops.length, 2)
-  assert.equal(hops[0]?.model, 'claude-sonnet-4-6')
+  assert.equal(hops[0]?.model, '<maka-default>')
+  assert.equal(
+    logs.filter((l) => l.includes('[maka] model pin (claude-sonnet-4-6) is ignored')).length,
+    1,
+  )
   assert.ok(logs.some((l) => l.includes('[maka] tool Read README.md')))
   assert.ok(logs.some((l) => l.includes('pong #1')))
   assert.ok(logs.some((l) => l.includes('pong #2')))
@@ -194,7 +199,6 @@ test('maka persistent session pins permission_mode=bypass and model once across 
       'initialize',
       'session/new',
       'session/set_config_option',
-      'session/set_config_option',
       'session/prompt',
       'session/prompt',
     ],
@@ -204,11 +208,10 @@ test('maka persistent session pins permission_mode=bypass and model once across 
     configId: 'permission_mode',
     value: 'bypass',
   })
-  assert.deepEqual(calls[3]?.params, {
-    sessionId: 'maka-sess-fresh',
-    configId: 'model',
-    value: 'claude-sonnet-4-6',
-  })
+  assert.equal(
+    calls.some((c) => c.method === 'session/set_config_option' && c.params?.configId === 'model'),
+    false,
+  )
 })
 
 test('maka ignores replayed session/update notifications emitted during session/load', async () => {
@@ -253,31 +256,24 @@ test('maka auto-answers server-initiated session/request_permission requests wit
   })
 })
 
-test('maka retries a rejected model pin on the next wake and still completes turns', async () => {
-  const f = await makeFixture('reject-model')
-  const logs: string[] = []
+test('maka treats stopReason=cancelled as a failed turn instead of success', async () => {
+  const f = await makeFixture('cancelled')
+  const hops: EngineHopReport[] = []
   const session = getAdapter('maka').startSession?.({
     home: f.home,
     env: f.env,
-    model: 'unsupported-model',
     standingPrompt: null,
     resumeSessionId: null,
-    onLog: (l) => logs.push(l),
+    onLog: () => {},
+    onHopUsage: (h) => hops.push(h),
   })
   assert.ok(session)
   liveSessions.push(session)
 
-  const r1 = await session.send('one')
-  const r2 = await session.send('two')
-  assert.equal(r1.exitCode, 0)
-  assert.equal(r2.exitCode, 0)
-  assert.ok(logs.some((l) => l.includes('model pin rejected')))
-
-  const calls = await f.readCalls()
-  assert.equal(
-    calls.filter((c) => c.method === 'session/set_config_option' && c.params?.configId === 'model').length,
-    2,
-  )
+  const r = await session.send('fail with cancelled stopReason')
+  assert.equal(r.exitCode, 1)
+  assert.match(r.error ?? '', /cancelled/i)
+  assert.equal(hops.length, 0)
 })
 
 test('maka self-heals a stale resume at load time and reports a fresh session', async () => {
@@ -337,7 +333,7 @@ test('maka process dying MID-TURN resolves the turn as a failure, never rejects'
   assert.equal(session.alive, false)
 })
 
-test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use explore mode', async () => {
+test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use bypass mode', async () => {
   const f = await makeFixture()
   const adapter = getAdapter('maka')
   await adapter.seedHome(f.home, {
@@ -363,7 +359,7 @@ test('maka seedHome writes AGENTS.md and .agents/skills, and classify/probe use 
 
   const calls = await f.readCalls()
   const permCfg = calls.find((c) => c.method === 'session/set_config_option' && c.params?.configId === 'permission_mode')
-  assert.equal(permCfg?.params?.value, 'explore')
+  assert.equal(permCfg?.params?.value, 'bypass')
 })
 
 test('maka probeWake exercises the acp handshake and one-shot run returns text', async () => {

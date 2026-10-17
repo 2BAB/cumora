@@ -789,7 +789,6 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   const zcodeDefault = process.env.CUMORA_DEFAULT_ZCODE_MODEL?.trim() || null
-  const makaDefault = process.env.CUMORA_DEFAULT_MAKA_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, engineDefaults, ...agent } = r
     // A profile's endpoint owns its model namespace: neither the computer's
@@ -840,7 +839,7 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
                       : r.engine === 'zcode'
                         ? zcodeDefault
                         : r.engine === 'maka'
-                          ? makaDefault
+                          ? null
                           : null
     return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
   })

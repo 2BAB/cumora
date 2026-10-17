@@ -132,8 +132,7 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
   },
   maka: {
     versionArgs: ['--version'],
-    npm: 'maka-agent',
-    selfUpdate: 'maka update',
+    selfUpdate: 'maka update --target latest',
   },
   hermes: {
     versionArgs: ['version'],

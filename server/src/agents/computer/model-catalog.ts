@@ -137,13 +137,11 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     source: 'presets',
   },
   maka: {
-    // Maka resolves models against the operator's configured provider profiles
-    // in ~/.maka/config.json; supportsCustom lets an agent pin any model id
-    // its local Maka runtime accepts.
+    // Maka selects models in its own settings; ACP does not expose model selection.
     models: [],
     defaultModel: null,
     defaultFastModel: null,
-    supportsCustom: true,
+    supportsCustom: false,
     fastModelScope: 'agent',
     source: 'presets',
   },

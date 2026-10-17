@@ -2514,7 +2514,7 @@ export class AgentRunner {
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
     if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
-    if (this.adapter.id === 'maka') return this.agent.model ?? '<maka-default>'
+    if (this.adapter.id === 'maka') return '<maka-default>'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }

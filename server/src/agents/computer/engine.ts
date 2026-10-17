@@ -3430,18 +3430,8 @@ class ZcodeAdapter implements EngineAdapter {
 }
 
 // ─── maka ─────────────────────────────────────────────────────────────────
-//
-// Apache Maka (the `maka` CLI, or its legacy `dsh` binary alias) ships a native
-// ACP v1 stdio server via `maka --acp`.
-//
-// Protocol lifecycle:
-//   1. `initialize` → `session/load` (falling back to `session/new` when the
-//      Runtime Host session was deleted/archived or does not match `cwd`)
-//   2. `session/set_config_option` (`permission_mode`: `bypass` for agent turns,
-//      `explore` for read-only triage/probe; plus `model` when configured)
-//   3. `session/prompt` per wake, streaming `session/update` notifications
-//      (`agent_message_chunk`, `tool_call`) and auto-answering any
-//      server-initiated `session/request_permission` requests.
+// Apache Maka (`maka --acp`) ACP v1 persistent session: initialize →
+// session/load (fallback session/new) → permission_mode=bypass → session/prompt.
 
 /** Resolve the Maka CLI binary (`CUMORA_MAKA_BIN` override, then `maka` or
  *  legacy `dsh` on `env.PATH`). */
@@ -3477,14 +3467,12 @@ interface MakaTurnOptions {
   env: NodeJS.ProcessEnv
   prompt: string
   model?: string | null
-  permissionMode?: 'bypass' | 'explore'
   signal: AbortSignal
   onLog?: (line: string) => void
   onHopUsage?: (r: EngineHopReport) => void
 }
 
 interface MakaSessionOptions extends EngineSessionArgs {
-  permissionMode?: 'bypass' | 'explore'
   onAgentText?: (text: string) => void
   signal?: AbortSignal
 }
@@ -3500,9 +3488,8 @@ class MakaSession implements EngineSession {
   private readonly onHopUsage?: (r: EngineHopReport) => void
   private readonly onAgentText?: (text: string) => void
   private readonly model: string | null
-  private readonly permissionMode: 'bypass' | 'explore'
   private permissionModeUnapplied = true
-  private modelUnapplied: boolean
+  private modelWarned = false
   private turn: { resolve: (r: EngineRunResult) => void } | null = null
   private promptInFlight = false
   private steerWarned = false
@@ -3513,8 +3500,6 @@ class MakaSession implements EngineSession {
     this.onHopUsage = opts.onHopUsage
     this.onAgentText = opts.onAgentText
     this.model = opts.model ?? null
-    this.permissionMode = opts.permissionMode ?? 'bypass'
-    this.modelUnapplied = !!opts.model
     this.conn = new AcpRpcConnection(
       resolveMakaAcpSpawn(env),
       home,
@@ -3557,18 +3542,23 @@ class MakaSession implements EngineSession {
         prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
       })
       this.conn.resumed = false
+      const stopReason = (resp.result as { stopReason?: unknown } | undefined)?.stopReason
+      if (stopReason === 'cancelled') {
+        settle(this.failureResult('maka turn was cancelled', wasResume, 1))
+        return done
+      }
       const usage = extractAcpUsage(resp.result) ?? undefined
       if (this.onHopUsage) {
         try {
           this.onHopUsage({
-            model: this.model ?? 'maka',
+            model: '<maka-default>',
             usage: usage ?? {},
             latencyMs: Date.now() - startedAt,
             hopIndex: 1,
           })
         } catch { /* never break the stream */ }
       }
-      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model: this.model }, wasResume))
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model: '<maka-default>' }, wasResume))
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       const wasResume = this.conn.resumed
@@ -3594,30 +3584,21 @@ class MakaSession implements EngineSession {
 
   private async applySessionConfig(): Promise<void> {
     if (!this.conn.sid) return
+    if (!this.modelWarned && this.model) {
+      this.modelWarned = true
+      this.log(`[maka] model pin (${this.model}) is ignored — Maka selects its model in its own settings; ACP does not expose model selection`)
+    }
     if (this.permissionModeUnapplied) {
       try {
         await this.conn.rpc('session/set_config_option', {
           sessionId: this.conn.sid,
           configId: 'permission_mode',
-          value: this.permissionMode,
+          value: 'bypass',
         })
         this.permissionModeUnapplied = false
       } catch (err) {
         const why = err instanceof Error ? err.message : String(err)
         this.log(`[maka] permission_mode pin rejected (${why}) — continuing`)
-      }
-    }
-    if (this.modelUnapplied && this.model) {
-      try {
-        await this.conn.rpc('session/set_config_option', {
-          sessionId: this.conn.sid,
-          configId: 'model',
-          value: this.model,
-        })
-        this.modelUnapplied = false
-      } catch (err) {
-        const why = err instanceof Error ? err.message : String(err)
-        this.log(`[maka] model pin rejected (${why}) — continuing on the engine default`)
       }
     }
   }
@@ -3647,12 +3628,12 @@ class MakaSession implements EngineSession {
       const options = Array.isArray(msg.params?.options)
         ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
         : []
-      const preferred = this.permissionMode === 'explore'
-        ? options.find((o) => o?.kind === 'reject_once' || o?.kind === 'reject_always')
-        : (options.find((o) => o?.kind === 'allow_always') ?? options.find((o) => o?.kind === 'allow_once') ?? options[0])
+      const preferred = options.find((o) => o?.kind === 'allow_always')
+        ?? options.find((o) => o?.kind === 'allow_once')
+        ?? options[0]
       const optionId = typeof preferred?.optionId === 'string' && preferred.optionId
         ? preferred.optionId
-        : (this.permissionMode === 'explore' ? 'reject_once' : 'allow_once')
+        : 'allow_once'
       this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId } })
       return
     }
@@ -3679,7 +3660,6 @@ async function runMakaAcpTurn(opts: MakaTurnOptions): Promise<EngineRunResult & 
     home: opts.cwd,
     env: opts.env,
     model: opts.model,
-    permissionMode: opts.permissionMode,
     standingPrompt: null,
     resumeSessionId: null,
     onLog: opts.onLog ?? (() => {}),
@@ -3713,7 +3693,6 @@ class MakaAdapter implements EngineAdapter {
       env: args.env,
       prompt: args.prompt,
       model: args.model,
-      permissionMode: 'bypass',
       signal: args.signal,
       onLog: args.onLog,
       onHopUsage: args.onHopUsage,
@@ -3730,7 +3709,6 @@ class MakaAdapter implements EngineAdapter {
       env: args.env,
       prompt: args.prompt,
       model: args.model,
-      permissionMode: 'explore',
       signal: args.signal,
       onLog: args.onLog,
     })
@@ -3741,7 +3719,6 @@ class MakaAdapter implements EngineAdapter {
       cwd: args.cwd,
       env: args.env,
       prompt: DOCTOR_PROMPT,
-      permissionMode: 'explore',
       signal: args.signal,
     })
   }
