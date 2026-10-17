@@ -1647,7 +1647,7 @@ interface PendingHop {
   runId: string | null
   conversationId: string | null
   model: string
-  usage: TokenUsage | null
+  usage?: TokenUsage | null
   latencyMs: number
   status: 'ok' | 'rate_limited' | 'timeout' | 'failed'
   error?: string | null
@@ -1921,7 +1921,7 @@ export class AgentRunner {
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
         model: report.model,
-        usage: this.hopUsageOf(report.usage),
+        usage: report.usage ? this.hopUsageOf(report.usage) : undefined,
         latencyMs: report.latencyMs ?? 0,
         status: 'ok',
         extras: Object.keys(extras).length ? extras : undefined,

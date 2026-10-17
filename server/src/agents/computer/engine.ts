@@ -763,7 +763,7 @@ export interface EngineHopReport {
    *  gpt-5.5). The model on this hop's own message — NOT the session default,
    *  since native auto-compaction etc. can switch models mid-turn. */
   model: string
-  usage: EngineUsage
+  usage?: EngineUsage
   /** Wall-clock ms since the engine emitted this hop's first event to the
    *  emission of its terminating event (so cache warming etc. are visible). */
   latencyMs?: number
@@ -2767,8 +2767,8 @@ function extractAcpUsage(result: unknown): EngineUsage | undefined {
   const usage: EngineUsage = {
     input_tokens: num(raw.input_tokens) ?? num(raw.inputTokens),
     output_tokens: num(raw.output_tokens) ?? num(raw.outputTokens),
-    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cacheReadInputTokens),
-    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cacheCreationInputTokens),
+    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cachedReadTokens) ?? num(raw.cacheReadInputTokens),
+    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cachedWriteTokens) ?? num(raw.cacheCreationInputTokens),
   }
   if (usage.input_tokens == null && usage.output_tokens == null) return undefined
   return usage
@@ -3035,6 +3035,8 @@ class AcpRpcConnection {
   private reqId = 0
   /** In-flight requests awaiting their JSON-RPC response. */
   private readonly waiters = new Map<number, (msg: AcpMsg) => void>()
+  private readonly stdoutDecoder = new StringDecoder('utf8')
+  private readonly stderrDecoder = new StringDecoder('utf8')
   private outBuf = ''
   /** Settles when the handshake completes; rejects when the handshake or the
    *  process itself failed. send() awaits it, and so does probeWake(). */
@@ -3059,7 +3061,7 @@ class AcpRpcConnection {
     this.signal = signal
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
-      for (const raw of b.toString('utf8').split('\n')) {
+      for (const raw of this.stderrDecoder.write(b).split('\n')) {
         const l = cleanLine(raw)
         if (l) this.hooks.onLog(l)
       }
@@ -3131,7 +3133,7 @@ class AcpRpcConnection {
   }
 
   private onStdout(buf: Buffer): void {
-    this.outBuf += buf.toString('utf8')
+    this.outBuf += this.stdoutDecoder.write(buf)
     let nl: number
     while ((nl = this.outBuf.indexOf('\n')) >= 0) {
       const line = this.outBuf.slice(0, nl)
@@ -3238,7 +3240,7 @@ class ZcodeSession implements EngineSession {
         try {
           this.onHopUsage({
             model: this.model ?? 'zcode',
-            usage: usage ?? {},
+            usage,
             latencyMs: Date.now() - startedAt,
             hopIndex: 1,
           })
@@ -3552,7 +3554,7 @@ class MakaSession implements EngineSession {
         try {
           this.onHopUsage({
             model: '<maka-default>',
-            usage: usage ?? {},
+            usage,
             latencyMs: Date.now() - startedAt,
             hopIndex: 1,
           })

@@ -48,7 +48,7 @@ const finishPrompt = (id, sid) => {
     result: mode === 'with-usage'
       ? {
           stopReason: 'end_turn',
-          usage: { inputTokens: 100, inputTokenDetails: { cacheReadTokens: 25, cacheWriteTokens: 5 }, outputTokens: 12 },
+          usage: { inputTokens: 110, cachedReadTokens: 30, cachedWriteTokens: 10, outputTokens: 15 },
         }
       : {
           stopReason: 'end_turn',
@@ -117,6 +117,7 @@ rl.on('line', (line) => {
       return
     }
     if (mode === 'ask-permission') {
+      pendingPrompt = { id: msg.id, sid: msg.params.sessionId }
       // Deliberately use id: 1 to verify server->client requests do not collide with client waiters.
       send({
         jsonrpc: '2.0',
@@ -126,14 +127,16 @@ rl.on('line', (line) => {
           sessionId: msg.params.sessionId,
           toolCall: { toolCallId: 'tc-perm', title: 'Write file' },
           options: [
-            { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
-            { optionId: 'allow_always', name: 'Always allow', kind: 'allow_always' },
-            { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+            { optionId: '550e8400-e29b-41d4-a716-446655440001', name: 'Allow once', kind: 'allow_once' },
+            { optionId: '550e8400-e29b-41d4-a716-446655440002', name: 'Always allow', kind: 'allow_always' },
+            { optionId: '550e8400-e29b-41d4-a716-446655440003', name: 'Reject', kind: 'reject_once' },
           ],
         },
       })
+      return
     }
     if (mode === 'ask-permission-reject-only') {
+      pendingPrompt = { id: msg.id, sid: msg.params.sessionId }
       send({
         jsonrpc: '2.0',
         id: 1,
@@ -142,33 +145,39 @@ rl.on('line', (line) => {
           sessionId: msg.params.sessionId,
           toolCall: { toolCallId: 'tc-perm', title: 'Write file' },
           options: [
-            { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+            { optionId: '550e8400-e29b-41d4-a716-446655440003', name: 'Reject', kind: 'reject_once' },
           ],
         },
       })
+      return
     }
     const sid = msg.params.sessionId
-    send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: { sessionId: sid, update: { sessionUpdate: 'tool_call', toolCallId: 'tc-1', title: 'Read README.md' } },
-    })
-    send({
-      jsonrpc: '2.0',
-      method: 'session/update',
-      params: {
-        sessionId: sid,
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'pong #' + prompts } },
-      },
-    })
-    send({
-      jsonrpc: '2.0',
-      id: msg.id,
-      result: {
-        stopReason: 'end_turn',
-        usage: { inputTokens: 110, cachedReadTokens: 30, outputTokens: 15 },
-      },
-    })
+    if (mode === 'split-utf8') {
+      const updateFrame = Buffer.from(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: sid,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '你好世界' } },
+          },
+        }) + '\n',
+        'utf8',
+      )
+      // '你' in UTF-8 is 0xe4 0xbd 0xa0 — split right after the first byte (0xe4)
+      const splitIndex = updateFrame.indexOf(0xe4) + 1
+      process.stdout.write(updateFrame.subarray(0, splitIndex))
+      setTimeout(() => {
+        process.stdout.write(updateFrame.subarray(splitIndex))
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { stopReason: 'end_turn' },
+        })
+      }, 15)
+      return
+    }
+    finishPrompt(msg.id, sid)
   }
 })
 `
@@ -231,10 +240,10 @@ test('maka persistent session pins permission_mode=bypass once across wakes and 
   assert.equal(r1.sessionId, 'maka-sess-fresh')
   assert.equal(r2.sessionId, 'maka-sess-fresh')
   assert.equal(r1.model, '<maka-default>')
-  assert.equal(r1.usage?.input_tokens, 110)
-  assert.equal(r1.usage?.output_tokens, 15)
+  assert.equal(r1.usage, undefined)
   assert.equal(hops.length, 2)
   assert.equal(hops[0]?.model, '<maka-default>')
+  assert.equal(hops[0]?.usage, undefined)
   assert.equal(
     logs.filter((l) => l.includes('[maka] model pin (claude-sonnet-4-6) is ignored')).length,
     1,
@@ -500,3 +509,49 @@ test('maka does not fall back to dsh when only dsh is on PATH', async () => {
   })
   assert.equal(wake.ok, false)
 })
+
+test('maka extracts ACP standard cachedReadTokens and cachedWriteTokens when usage is present', async () => {
+  const f = await makeFixture('with-usage')
+  const hops: EngineHopReport[] = []
+  const session = getAdapter('maka').startSession?.({
+    home: f.home,
+    env: f.env,
+    standingPrompt: null,
+    resumeSessionId: null,
+    onLog: () => {},
+    onHopUsage: (h) => hops.push(h),
+  })
+  assert.ok(session)
+  liveSessions.push(session)
+
+  const r = await session.send('turn with usage')
+  assert.equal(r.exitCode, 0)
+  assert.deepEqual(r.usage, {
+    input_tokens: 110,
+    output_tokens: 15,
+    cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 10,
+  })
+  assert.equal(hops.length, 1)
+  assert.deepEqual(hops[0]?.usage, {
+    input_tokens: 110,
+    output_tokens: 15,
+    cache_read_input_tokens: 30,
+    cache_creation_input_tokens: 10,
+  })
+})
+
+test('acp connection decodes multi-byte UTF-8 characters split across stdout chunks without replacement characters', async () => {
+  const f = await makeFixture('split-utf8')
+  const controller = new AbortController()
+  const classified = await getAdapter('maka').classify({
+    cwd: f.home,
+    env: f.env,
+    prompt: 'say hello in Chinese',
+    signal: controller.signal,
+  })
+  assert.equal(classified.error, undefined)
+  assert.equal(classified.text, '你好世界')
+  assert.ok(!classified.text.includes('\uFFFD'))
+})
+
