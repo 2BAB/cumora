@@ -5443,8 +5443,10 @@ interface AntigravityEvent {
     step_index?: number
     state?: string
     step_type?: string
+    tool_name?: string
     text_delta?: string
     tool_info?: unknown
+    usage?: AntigravityNativeUsage
   }
   result?: {
     conversation_id?: string
@@ -5464,15 +5466,15 @@ function antigravityCounter(value: unknown): number {
 
 /** Convert Antigravity's counters without charging cache reads twice.
  *
- * `input_tokens` is the complete prompt, including cache reads (the documented
- * examples satisfy total = input + output). Cumora's common shape wants fresh
- * input and cache reads in disjoint fields. `thinking_tokens` is a subset of
- * output_tokens, not an extra token class, so it is intentionally not added
- * again. */
+ * When `input_tokens` includes `cache_read_tokens` (`input_tokens >= cache_read_tokens`),
+ * subtract `cache_read_tokens` so fresh input and cache reads stay disjoint. When
+ * `agy` reports `input_tokens` already net of cache reads (`input_tokens < cache_read_tokens`,
+ * where `total_tokens = input_tokens + output_tokens`), preserve `input_tokens` as-is. */
 function antigravityUsage(raw: AntigravityNativeUsage | undefined): EngineUsage | undefined {
   if (!raw) return undefined
   const cached = antigravityCounter(raw.cache_read_tokens)
-  const input = Math.max(0, antigravityCounter(raw.input_tokens) - cached)
+  const rawInput = antigravityCounter(raw.input_tokens)
+  const input = rawInput >= cached ? rawInput - cached : rawInput
   const output = antigravityCounter(raw.output_tokens)
   if (!input && !output && !cached) return undefined
   return {
@@ -5503,6 +5505,19 @@ function antigravityUsageDelta(
   }
 }
 
+function addAntigravityUsage(
+  acc: AntigravityNativeUsage | undefined,
+  step: AntigravityNativeUsage,
+): AntigravityNativeUsage {
+  return {
+    input_tokens: antigravityCounter(acc?.input_tokens) + antigravityCounter(step.input_tokens),
+    output_tokens: antigravityCounter(acc?.output_tokens) + antigravityCounter(step.output_tokens),
+    thinking_tokens: antigravityCounter(acc?.thinking_tokens) + antigravityCounter(step.thinking_tokens),
+    cache_read_tokens: antigravityCounter(acc?.cache_read_tokens) + antigravityCounter(step.cache_read_tokens),
+    total_tokens: antigravityCounter(acc?.total_tokens) + antigravityCounter(step.total_tokens),
+  }
+}
+
 function parseAntigravityLine(line: string): AntigravityEvent | null {
   if (!line.startsWith('{')) return null
   try { return JSON.parse(line) as AntigravityEvent } catch { return null }
@@ -5515,25 +5530,32 @@ class AntigravityTurnTracker {
   error: string | null = null
   usage: EngineUsage | undefined
   private previousUsage: AntigravityNativeUsage | undefined
+  private turnStepUsage: AntigravityNativeUsage | undefined
   private startedAt: number | null = null
   private toolUses = 0
   private readonly seenToolSteps = new Set<number>()
+  private readonly seenResponseSteps = new Set<number>()
   private hopIndex = 0
+  private awaitingResumedBaseline: boolean
 
   constructor(
     pin: string | null,
     private readonly onHopUsage?: (report: EngineHopReport) => void,
+    resumedFromDisk = false,
   ) {
     this.model = pin
+    this.awaitingResumedBaseline = resumedFromDisk
   }
 
   beginTurn(): void {
     this.text = ''
     this.error = null
     this.usage = undefined
+    this.turnStepUsage = undefined
     this.startedAt = Date.now()
     this.toolUses = 0
     this.seenToolSteps.clear()
+    this.seenResponseSteps.clear()
   }
 
   /** Feed one event. True means the current turn reached its terminal result. */
@@ -5549,6 +5571,12 @@ class AntigravityTurnTracker {
         this.seenToolSteps.add(step.step_index)
         this.toolUses += 1
       }
+      if (step?.step_type === 'agent_response' && step.state === 'DONE' && step.usage) {
+        if (typeof step.step_index !== 'number' || !this.seenResponseSteps.has(step.step_index)) {
+          if (typeof step.step_index === 'number') this.seenResponseSteps.add(step.step_index)
+          this.turnStepUsage = addAntigravityUsage(this.turnStepUsage, step.usage)
+        }
+      }
       return false
     }
     if (event.event !== 'result' || !event.result) return false
@@ -5560,15 +5588,17 @@ class AntigravityTurnTracker {
         ? result.error
         : `antigravity turn ended with status ${result.status || 'UNKNOWN'}`
     }
-    const delta = antigravityUsageDelta(result.usage, this.previousUsage)
-    // Only a result that CARRIES usage moves the baseline. `usage` is optional
-    // in the protocol and an errored turn routinely omits it — overwriting the
-    // baseline with `undefined` there bills the next turn's whole cumulative
-    // session counter as one turn, which is the exact double-billing this
-    // tracker exists to prevent. Keeping the last known total means a
-    // usage-less turn bills nothing (correct: the CLI reported no spend) and
-    // the turn after it still bills only its own delta.
-    if (result.usage) this.previousUsage = result.usage
+    // Prefer the sum of per-step `agent_response` usages emitted during this turn:
+    // when resuming via `--conversation <id>`, `result.usage` includes historical
+    // turns from prior processes, whereas `turnStepUsage` covers only the current
+    // turn. Fall back to cumulative `result.usage` delta when no step usage was
+    // emitted (e.g. synthetic fixtures or pre-step errors on fresh sessions).
+    const delta = this.turnStepUsage
+      ?? (this.awaitingResumedBaseline ? undefined : antigravityUsageDelta(result.usage, this.previousUsage))
+    if (result.usage) {
+      this.previousUsage = result.usage
+      this.awaitingResumedBaseline = false
+    }
     this.usage = antigravityUsage(delta)
     if (this.usage && this.onHopUsage) {
       this.hopIndex += 1
@@ -5607,7 +5637,7 @@ class AntigravitySession implements EngineSession {
     private readonly opts: EngineSessionArgs,
     pin: string | null,
   ) {
-    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage)
+    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage, Boolean(opts.resumeSessionId))
     this.child = spawnEngineChild(command, argv, {
       cwd: opts.home,
       env: opts.env,
@@ -5686,8 +5716,20 @@ class AntigravitySession implements EngineSession {
     const line = cleanLine(raw)
     if (!line) return
     pushTail(this.stdoutTail, line)
-    this.opts.onLog(line)
     const event = parseAntigravityLine(line)
+    if (event?.event === 'step_update' && event.step_update) {
+      const step = event.step_update
+      const toolName = step.tool_name ?? (step.tool_info as { name?: string } | undefined)?.name
+      if (step.step_type === 'tool' && step.state === 'ACTIVE' && typeof toolName === 'string' && toolName) {
+        this.opts.onLog(`[antigravity] tool ${toolName}`)
+      } else if (step.step_type === 'agent_response' && step.state === 'DONE' && typeof step.text_delta === 'string' && step.text_delta.trim()) {
+        this.opts.onLog(`[antigravity] » ${step.text_delta.replace(/\s+/g, ' ').trim().slice(0, 200)}`)
+      } else {
+        this.opts.onLog(line)
+      }
+    } else {
+      this.opts.onLog(line)
+    }
     if (event && this.tracker.observe(event)) {
       const eventError = this.tracker.error
       this.settle({
@@ -5736,30 +5778,37 @@ class AntigravityAdapter implements EngineAdapter {
   readonly id = 'antigravity' as const
   readonly bin = 'agy'
 
-  private sessionArgs(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): string[] {
+  private sessionArgs(args: EngineSessionArgs, mode: 'auto' | 'plan'): string[] {
     const model = args.model ? ['--model', args.model] : []
+    const resume = mode === 'auto' && args.resumeSessionId
+      ? ['--conversation', args.resumeSessionId]
+      : []
+    // Only pass `--sandbox` on the read-only triage/probe ('plan') path.
+    // Real agent turns ('auto') run inside Cumora's outer BYOA boundary and must
+    // write IPC requests to CUMORA_AGENT_IPC_DIR (outside <home>) to invoke
+    // `cumora glance/messages/reply/send` as well as read ~/.gitconfig and
+    // workspace paths; `--sandbox` on real turns causes every `cumora` CLI call
+    // to fail with EPERM on first attempt and waste an extra LLM turn retrying.
+    const sandbox = mode === 'plan' ? ['--sandbox'] : []
     return [
       '--input-format', 'stream-json',
       '--output-format', 'stream-json',
-      '--sandbox',
+      ...sandbox,
       '--mode', mode,
       '--dangerously-skip-permissions',
       '--disable-slash-commands',
+      ...resume,
       ...model,
     ]
   }
 
-  private start(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): AntigravitySession {
+  private start(args: EngineSessionArgs, mode: 'auto' | 'plan'): AntigravitySession {
     const { command, shell } = resolveSpawn(this.bin)
-    // Do not pass --conversation across daemon restarts yet. Its result usage is
-    // cumulative over the historical conversation, while Cumora persists only
-    // the id, not the prior counters; resuming would overbill that history as
-    // the first new turn. The per-agent home + memory remains durable.
     return new AntigravitySession(command, this.sessionArgs(args, mode), shell, args, args.model ?? null)
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
-    return this.start(args, 'accept-edits')
+    return this.start(args, 'auto')
   }
 
   async run(args: EngineRunArgs): Promise<EngineRunResult> {
@@ -5773,7 +5822,7 @@ class AntigravityAdapter implements EngineAdapter {
       onLog: args.onLog,
       onHopUsage: args.onHopUsage,
     }
-    const session = this.start(sessionArgs, 'accept-edits')
+    const session = this.start(sessionArgs, 'auto')
     const onAbort = (): void => { void session.stop({ force: true }) }
     args.signal.addEventListener('abort', onAbort, { once: true })
     if (args.signal.aborted) onAbort()

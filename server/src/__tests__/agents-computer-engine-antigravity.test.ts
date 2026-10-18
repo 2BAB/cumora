@@ -60,6 +60,33 @@ rl.on('line', (line) => {
     } })
     return
   }
+  if (process.env.FAKE_AGY_SCENARIO === 'resume-history') {
+    // Simulates resuming a conversation that already accumulated 1000 input /
+    // 100 output / 400 cache tokens in a previous daemon process.
+    const stepUsage = turn === 1
+      ? { input_tokens: 50, output_tokens: 8, thinking_tokens: 2, cache_read_tokens: 300, total_tokens: 58 }
+      : { input_tokens: 40, output_tokens: 6, thinking_tokens: 1, cache_read_tokens: 350, total_tokens: 46 }
+    const cumulative = turn === 1
+      ? { input_tokens: 1050, output_tokens: 108, thinking_tokens: 42, cache_read_tokens: 700, total_tokens: 1158 }
+      : { input_tokens: 1090, output_tokens: 114, thinking_tokens: 43, cache_read_tokens: 1050, total_tokens: 1204 }
+    out({ event: 'step_update', step_update: {
+      conversation_id: 'agy-conversation-resumed', step_index: turn * 2 - 1, state: 'ACTIVE', step_type: 'tool',
+      tool_name: 'run_command', tool_info: { name: 'run_command' },
+    } })
+    out({ event: 'step_update', step_update: {
+      conversation_id: 'agy-conversation-resumed', step_index: turn * 2 - 1, state: 'DONE', step_type: 'tool',
+      tool_name: 'run_command', tool_info: { name: 'run_command' },
+    } })
+    out({ event: 'step_update', step_update: {
+      conversation_id: 'agy-conversation-resumed', step_index: turn * 2, state: 'DONE', step_type: 'agent_response',
+      text_delta: 'resumed:' + content, usage: stepUsage,
+    } })
+    out({ event: 'result', result: {
+      conversation_id: 'agy-conversation-resumed', status: 'SUCCESS', response: 'resumed:' + content,
+      duration_seconds: turn, num_turns: turn + 5, model: 'Gemini 3.5 Flash (High)', usage: cumulative,
+    } })
+    return
+  }
   out({ event: 'step_update', step_update: {
     conversation_id: 'agy-conversation-1', step_index: turn, state: 'DONE', step_type: 'tool',
     tool_info: { name: 'run_command' },
@@ -103,7 +130,7 @@ async function fakeLog(f: Fixture): Promise<Array<Record<string, unknown>>> {
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
 }
 
-test('antigravity persistent session uses sandboxed stream-json and bills per-turn deltas', { skip: IS_WIN }, async () => {
+test('antigravity persistent session uses auto stream-json without inner --sandbox and bills per-turn deltas', { skip: IS_WIN }, async () => {
   const f = await fixture()
   const hops: EngineHopReport[] = []
   const session = getAdapter('antigravity').startSession?.({
@@ -142,13 +169,53 @@ test('antigravity persistent session uses sandboxed stream-json and bills per-tu
   const start = records.find((record) => record.type === 'start') as { argv: string[]; cwd: string }
   assert.ok(start.argv.includes('--input-format'))
   assert.ok(start.argv.includes('--output-format'))
-  assert.ok(start.argv.includes('--sandbox'))
+  assert.ok(!start.argv.includes('--sandbox'), 'real agent turns must not enable inner --sandbox or cumora IPC outside <home> fails with EPERM')
   assert.ok(start.argv.includes('--dangerously-skip-permissions'))
-  assert.equal(start.argv[start.argv.indexOf('--mode') + 1], 'accept-edits')
+  assert.equal(start.argv[start.argv.indexOf('--mode') + 1], 'auto')
   assert.ok(!start.argv.includes('first prompt'), 'the prompt must travel on stdin, not argv')
   assert.equal(start.cwd, await realpath(f.home))
   const prompts = records.filter((record) => record.type === 'prompt') as Array<{ event: { event: string; message: { content: string } } }>
   assert.deepEqual(prompts.map((record) => record.event.message.content), ['first prompt', 'second prompt'])
+})
+
+test('antigravity resumed session passes --conversation and bills step usage without historical double-charging', { skip: IS_WIN }, async () => {
+  const f = await fixture('resume-history')
+  const hops: EngineHopReport[] = []
+  const logs: string[] = []
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    model: 'Gemini 3.5 Flash (High)',
+    resumeSessionId: 'agy-conversation-resumed',
+    onLog: (line) => logs.push(line),
+    onHopUsage: (hop) => hops.push(hop),
+  })
+  assert.ok(session)
+
+  const first = await session.send('after restart 1')
+  const second = await session.send('after restart 2')
+  await session.stop()
+
+  // Turn 1's result.usage is 1050/108/700 (including 1000 historical input
+  // tokens from the prior process), but its agent_response step_update carried
+  // 50 fresh input / 8 output / 300 cache_read_tokens.
+  assert.deepEqual(first.usage, {
+    input_tokens: 50,
+    output_tokens: 8,
+    cache_read_input_tokens: 300,
+  })
+  assert.deepEqual(second.usage, {
+    input_tokens: 40,
+    output_tokens: 6,
+    cache_read_input_tokens: 350,
+  })
+  assert.equal(hops.length, 2)
+  assert.ok(logs.includes('[antigravity] tool run_command'))
+  assert.ok(logs.includes('[antigravity] » resumed:after restart 1'))
+
+  const records = await fakeLog(f)
+  const start = records.find((record) => record.type === 'start') as { argv: string[] }
+  assert.equal(start.argv[start.argv.indexOf('--conversation') + 1], 'agy-conversation-resumed')
 })
 
 test('antigravity keeps its usage baseline across a result that reports no usage', { skip: IS_WIN }, async () => {
@@ -200,6 +267,7 @@ test('antigravity triage uses plan mode and returns the current reply', { skip: 
   assert.equal(result.text, 'echo:classify this')
   const records = await fakeLog(f)
   const start = records.find((record) => record.type === 'start') as { argv: string[] }
+  assert.ok(start.argv.includes('--sandbox'))
   assert.equal(start.argv[start.argv.indexOf('--mode') + 1], 'plan')
   assert.equal(start.argv[start.argv.indexOf('--model') + 1], 'Gemini 3.5 Flash (Low)')
 })
