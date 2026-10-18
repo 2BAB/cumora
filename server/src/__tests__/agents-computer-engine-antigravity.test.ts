@@ -20,6 +20,7 @@ const tempDirs: string[] = []
 
 afterEach(async () => {
   delete process.env.CUMORA_TRIAGE_MODEL
+  delete process.env.CUMORA_AGY_POST_REPLY_GRACE_MS
   process.env.PATH = ORIGINAL_PATH
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
@@ -41,6 +42,17 @@ rl.on('line', (line) => {
   const content = event?.message?.content || ''
   if (log) fs.appendFileSync(log, JSON.stringify({ type: 'prompt', event }) + '\\n')
   turn += 1
+  // The post-reply summary hop: agy keeps working after the tool result and
+  // never emits a terminal result event here, which is exactly the window the
+  // daemon bounds once the reply has landed.
+  if (process.env.FAKE_AGY_SCENARIO === 'stall') {
+    out({ event: 'step_update', step_update: {
+      conversation_id: 'agy-conversation-1', step_index: turn, state: 'DONE', step_type: 'agent_response',
+      text_delta: 'partial summary',
+      usage: { input_tokens: 100, output_tokens: 10, thinking_tokens: 4, cache_read_tokens: 40, total_tokens: 110 },
+    } })
+    return
+  }
   if (process.env.FAKE_AGY_SCENARIO === 'error') {
     out({ event: 'result', result: {
       conversation_id: 'agy-conversation-1', status: 'ERROR', response: '', error: 'quota exhausted',
@@ -128,6 +140,16 @@ async function fixture(scenario = 'ok'): Promise<Fixture> {
 async function fakeLog(f: Fixture): Promise<Array<Record<string, unknown>>> {
   if (!existsSync(f.log)) return []
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+/** Wait for a condition the fixture satisfies asynchronously (child boot, the
+ *  init event that carries the conversation id). */
+async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<void> {
+  const started = Date.now()
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error('waitFor timed out')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
 }
 
 test('antigravity persistent session uses auto stream-json without inner --sandbox and bills per-turn deltas', { skip: IS_WIN }, async () => {
@@ -254,10 +276,8 @@ test('antigravity keeps its usage baseline across a result that reports no usage
   assert.deepEqual(hops.map((hop) => hop.usage), [first.usage, third.usage])
 })
 
-test('antigravity skips default cold local triage while explicit classify uses plan mode', { skip: IS_WIN }, async () => {
+test('antigravity classify runs in plan mode with --sandbox and honors CUMORA_TRIAGE_MODEL', { skip: IS_WIN }, async () => {
   const f = await fixture()
-  assert.equal(getAdapter('antigravity').skipLocalTriage, true)
-  assert.equal(getAdapter('claude').skipLocalTriage, undefined)
   process.env.CUMORA_TRIAGE_MODEL = 'Gemini 3.5 Flash (Low)'
   const result = await getAdapter('antigravity').classify({
     cwd: f.home,
@@ -269,7 +289,7 @@ test('antigravity skips default cold local triage while explicit classify uses p
   assert.equal(result.text, 'echo:classify this')
   const records = await fakeLog(f)
   const start = records.find((record) => record.type === 'start') as { argv: string[] }
-  assert.ok(start.argv.includes('--sandbox'))
+  assert.ok(start.argv.includes('--sandbox'), 'triage keeps the read-only plan sandbox')
   assert.equal(start.argv[start.argv.indexOf('--mode') + 1], 'plan')
   assert.equal(start.argv[start.argv.indexOf('--model') + 1], 'Gemini 3.5 Flash (Low)')
 })
@@ -309,4 +329,110 @@ test('antigravity is detected through the agy binary on PATH', { skip: IS_WIN },
   } finally {
     process.env.PATH = old
   }
+})
+
+test('antigravity inlines the standing prompt once, then only the delta rides each wake', { skip: IS_WIN }, async () => {
+  const f = await fixture()
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    onLog: () => {},
+  })
+  assert.ok(session)
+
+  // A fresh process has nothing in its transcript yet, so the daemon must inline
+  // the standing prompt (the biggest single source of per-wake context growth).
+  assert.equal(session.carriesStandingPrompt, false)
+  await session.send('turn 1')
+  assert.equal(session.carriesStandingPrompt, true, 'after the inline turn the daemon sends only the per-turn delta')
+  await session.send('turn 2')
+  assert.equal(session.carriesStandingPrompt, true)
+  await session.stop()
+})
+
+test('antigravity resumed conversation already carries the standing prompt', { skip: IS_WIN }, async () => {
+  const f = await fixture('resume-history')
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    resumeSessionId: 'agy-conversation-resumed',
+    onLog: () => {},
+  })
+  assert.ok(session)
+  assert.equal(session.carriesStandingPrompt, true, 'a resumed transcript holds the standing prompt from the prior process')
+  await session.stop()
+})
+
+test('antigravity ends the post-reply summary hop after the grace and still bills the partial hop', { skip: IS_WIN }, async () => {
+  const f = await fixture('stall')
+  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '20'
+  const logs: string[] = []
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    onLog: (line) => logs.push(line),
+  })
+  assert.ok(session)
+
+  // The fake never emits `result` — agy is still in its summary hop. Once the
+  // reply landed, that hop is pure dead time and must not hold the session.
+  const turn = session.send('reply then stall')
+  // A real reply lands long after agy's init event; wait for the conversation id
+  // the session persists so the early end can hand it to the next wake.
+  await waitFor(() => session.sessionId !== null)
+  session.noteReplyDelivered?.()
+  const result = await turn
+
+  assert.equal(result.exitCode, 0, 'an early end is a completed turn, not a failure')
+  assert.equal(result.error, undefined)
+  assert.equal(result.sessionId, 'agy-conversation-1', 'the conversation id must survive so the next wake resumes it')
+  assert.deepEqual(result.usage, { input_tokens: 60, output_tokens: 10, cache_read_input_tokens: 40 })
+  assert.equal(session.alive, false, 'the stalled process is reaped instead of lingering')
+  assert.ok(logs.some((line) => line.includes('reply already delivered')))
+  await session.stop({ force: true })
+})
+
+test('antigravity answers a ping that lands after the reply by ending the tail immediately', { skip: IS_WIN }, async () => {
+  const f = await fixture('stall')
+  // Grace 0 disables the timer: only the steer path can finish this turn, which
+  // is exactly the behaviour under test.
+  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '0'
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    onLog: () => {},
+  })
+  assert.ok(session)
+
+  const turn = session.send('reply then a teammate pings')
+  await waitFor(() => session.sessionId !== null)
+  session.noteReplyDelivered?.()
+  session.steer('a teammate pinged you')
+  const result = await turn
+
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.sessionId, 'agy-conversation-1')
+  assert.equal(session.alive, false, 'the rerun picks the ping up on a resumed conversation')
+  await session.stop({ force: true })
+})
+
+test('antigravity keeps its tail when no reply landed (steer stays a logged no-op)', { skip: IS_WIN }, async () => {
+  const f = await fixture()
+  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '20'
+  const logs: string[] = []
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    onLog: (line) => logs.push(line),
+  })
+  assert.ok(session)
+
+  const turn = session.send('a turn with no reply tool call')
+  session.steer('group noise')
+  const result = await turn
+
+  assert.equal(result.exitCode, 0)
+  assert.equal(session.alive, true, 'nothing was delivered, so the running turn is left alone')
+  assert.ok(logs.some((line) => line.includes('same-turn steer is not supported')))
+  await session.stop()
 })

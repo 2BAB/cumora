@@ -140,9 +140,13 @@ const AVAIL_REASSERT_MS = 10 * 60_000
 // Pre-turn wake debounce. The FIRST wake from
 // an idle state arms this timer; wakes arriving within the window FOLD INTO it —
 // the turn snapshots ALL unread, so a burst of group messages becomes ONE big-
-// engine turn instead of N. Content-blind, no classification. Trades a small reply
-// latency (a beat before the agent starts) for far fewer spawns in a busy room.
-const WAKE_DEBOUNCE_MS = 2_500
+// engine turn instead of N. Content-blind, no classification.
+//
+// 500ms, not 2.5s: this delay sits on the critical path of EVERY reply, and a live
+// chat measurement showed the two waits (2.53s each) costing more perceived
+// latency than the coalescing saved — a room's burst still folds in at 500ms
+// because the timer only starts once the first wake lands.
+const WAKE_DEBOUNCE_MS = 500
 // Same-turn group notice (default ON — set CUMORA_BYOA_STEER_GROUP=0
 // to disable). A DIRECT ping (DM / @me / human) is ALWAYS steered into the live
 // turn (see maybeSteer). With this on, plain GROUP activity arriving while busy
@@ -2221,16 +2225,28 @@ export class AgentRunner {
         return { exitCode: 70, error: `HTTP ${res.status} ${body.slice(0, 200)}`.trim() }
       }
       const data = await res.json() as { text?: unknown; exitCode?: unknown }
-      return {
-        text: typeof data.text === 'string' ? data.text : '',
-        exitCode: typeof data.exitCode === 'number' ? data.exitCode : 0,
-      }
+      const text = typeof data.text === 'string' ? data.text : ''
+      const exitCode = typeof data.exitCode === 'number' ? data.exitCode : 0
+      if (exitCode === 0) this.noteEngineReplyDelivered(argv, text)
+      return { text, exitCode }
     } catch (err) {
       return { exitCode: 70, error: err instanceof Error ? err.message : String(err) }
     } finally {
       clearTimeout(timeout)
       lifecycleSignal.removeEventListener('abort', onLifecycleAbort)
     }
+  }
+
+  /** Forward a LANDED reply to the live engine session. This is the turn's
+   *  user-visible effect: an engine with a post-tool summary hop (agy) can bound
+   *  how long it keeps the session locked after the message is already out.
+   *  A HELD response is NOT a delivery — the reply was withheld and the turn
+   *  still has real work (re-compose), so it must keep its normal tail. */
+  private noteEngineReplyDelivered(argv: string[], text: string): void {
+    const command = argv[0]
+    if (command !== 'reply' && command !== 'send') return
+    if (/NOT sent/i.test(text)) return
+    try { this.engineSession?.noteReplyDelivered?.() } catch { /* observability only */ }
   }
 
   /** Env handed to the engine subprocess. Secure mode preserves the operator's
@@ -2385,17 +2401,11 @@ export class AgentRunner {
     if (!payload) return null
     if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
     if (!payload.instructions || !payload.input) return null
-    if (this.adapter.skipLocalTriage && !this.triageModelPin()) {
-      return {
-        actionable: true,
-        reason: `${this.adapter.id} skips cold local triage spawn; persistent main brain judges in-turn`,
-        promptNote:
-          'No separate small-brain triage ran for this wake. Read the unread messages and recent context yourself: ' +
-          'respond or act only if a human is involved/waiting, a teammate needs your specific answer or action, or your reply advances active claimed work; ' +
-          'otherwise stay silent and do not post.',
-        source: 'support-model-local',
-      }
-    }
+    // No per-engine "skip triage" escape hatch. It looked like a win (dodge one
+    // cold CLI spawn per wake) but triage is NOT on the reply critical path:
+    // triage-core answers human DMs/groups deterministically without a model,
+    // and the small brain runs on the local cheap model. The escape hatch only
+    // made one engine judge its own inbox instead of using the shared gate.
 
     // Triage concurrency gate + deterministic spawn pacer. Pacer is shared
     // with the big-brain path (same Anthropic/OpenAI account quota, same
@@ -2687,6 +2697,16 @@ export class AgentRunner {
       // coordinates identically to the cloud pod-agent.
       GLANCE_YIELD_RULES + `\n\n` +
       postingMechanicsText(this.promptSurface()) +
+      // Two cost rules discovered on live `agy` runs:
+      //  1. The reply tool IS the deliverable. Anything the model writes after it
+      //     returns is a summary nobody reads, but the engine still spends a full
+      //     model hop on it while the session stays locked.
+      //  2. agy's command-safety monitor flags shell-operator-shaped commands
+      //     (`unquoted_shell_operators`) and re-reviews every one of them with a
+      //     small model — ~1.5s per `cumora` call, on the critical path of a reply.
+      `Once a \`cumora reply\` / \`send\` returns success the message is already delivered — ` +
+      `end the turn there. Do NOT restate it, summarise it, or narrate what you just did. ` +
+      `Keep each \`cumora\` call a SINGLE fully quoted command with no pipes, \`&&\`, or redirection. ` +
       `When you're answering a ` +
       `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
       `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +
