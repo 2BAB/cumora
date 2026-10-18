@@ -2385,6 +2385,17 @@ export class AgentRunner {
     if (!payload) return null
     if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
     if (!payload.instructions || !payload.input) return null
+    if (this.adapter.skipLocalTriage && !this.triageModelPin()) {
+      return {
+        actionable: true,
+        reason: `${this.adapter.id} skips cold local triage spawn; persistent main brain judges in-turn`,
+        promptNote:
+          'No separate small-brain triage ran for this wake. Read the unread messages and recent context yourself: ' +
+          'respond or act only if a human is involved/waiting, a teammate needs your specific answer or action, or your reply advances active claimed work; ' +
+          'otherwise stay silent and do not post.',
+        source: 'support-model-local',
+      }
+    }
 
     // Triage concurrency gate + deterministic spawn pacer. Pacer is shared
     // with the big-brain path (same Anthropic/OpenAI account quota, same

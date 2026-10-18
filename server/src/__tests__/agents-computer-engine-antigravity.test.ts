@@ -254,8 +254,10 @@ test('antigravity keeps its usage baseline across a result that reports no usage
   assert.deepEqual(hops.map((hop) => hop.usage), [first.usage, third.usage])
 })
 
-test('antigravity triage uses plan mode and returns the current reply', { skip: IS_WIN }, async () => {
+test('antigravity skips default cold local triage while explicit classify uses plan mode', { skip: IS_WIN }, async () => {
   const f = await fixture()
+  assert.equal(getAdapter('antigravity').skipLocalTriage, true)
+  assert.equal(getAdapter('claude').skipLocalTriage, undefined)
   process.env.CUMORA_TRIAGE_MODEL = 'Gemini 3.5 Flash (Low)'
   const result = await getAdapter('antigravity').classify({
     cwd: f.home,

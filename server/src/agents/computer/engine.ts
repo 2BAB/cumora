@@ -846,6 +846,10 @@ export interface EngineAdapter {
   startSession?(args: EngineSessionArgs): EngineSession | null
   /** Run a LOCAL small-brain triage completion, returning raw text. */
   classify(args: EngineClassifyArgs): Promise<EngineClassifyResult>
+  /** True when the engine has no lightweight small-brain alias and cold-spawning
+   *  a separate triage CLI process per wake is slower and more expensive than
+   *  waking the warm persistent session directly (unless a triage model is pinned). */
+  readonly skipLocalTriage?: boolean
   /** `doctor` liveness probe for one brain tier (big/small). Same one-shot spawn
    *  as classify, with a trivial prompt — used to diagnose whether each brain is
    *  reachable + authed on this machine. */
@@ -5777,6 +5781,7 @@ class AntigravitySession implements EngineSession {
 class AntigravityAdapter implements EngineAdapter {
   readonly id = 'antigravity' as const
   readonly bin = 'agy'
+  readonly skipLocalTriage = true
 
   private sessionArgs(args: EngineSessionArgs, mode: 'auto' | 'plan'): string[] {
     const model = args.model ? ['--model', args.model] : []
