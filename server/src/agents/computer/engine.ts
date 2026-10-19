@@ -815,13 +815,6 @@ export interface EngineSession {
    *  stream-json boundary so the agent answers a direct ping mid-task, then
    *  continues. No-op if no turn is in flight. */
   steer(text: string): void
-  /** The daemon just observed that this turn's user-visible reply actually
-   *  landed (a `cumora reply` / `send` returned success). Engines whose turn
-   *  keeps working after the tool result — agy spends one more model hop on a
-   *  summary the user never reads — use this to bound how long the session
-   *  stays locked after the message is already out. Optional: engines whose
-   *  turn ends with the reply simply ignore it. */
-  noteReplyDelivered?(): void
   /** Process is up and stdin is writable. */
   readonly alive: boolean
   /** The latest session id seen (to `--resume` if the process must be respawned). */
@@ -5565,13 +5558,6 @@ class AntigravityTurnTracker {
     this.seenResponseSteps.clear()
   }
 
-  /** Usage accrued so far this turn (the per-step `agent_response` sum). Needed
-   *  when a turn is completed early — BEFORE agy emits its terminal `result` —
-   *  so the ledger still bills the work that actually ran. */
-  partialUsage(): EngineUsage | undefined {
-    return antigravityUsage(this.turnStepUsage)
-  }
-
   /** Feed one event. True means the current turn reached its terminal result. */
   observe(event: AntigravityEvent): boolean {
     const id = event.conversation_id ?? event.init?.conversation_id ?? event.result?.conversation_id
@@ -5631,26 +5617,6 @@ class AntigravityTurnTracker {
   }
 }
 
-/** How long the session may stay locked in agy's post-tool summary hop AFTER the
- *  reply already landed. That hop is invisible to the user (they already have
- *  the message), yet it holds `pending`, so any ping arriving meanwhile waits.
- *
- *  60s, and that number is deliberate: ending a turn early is only possible by
- *  reaping the process (agy has no cancel-turn), which costs a 2.4–4.8s cold
- *  spawn on the NEXT wake and throws away the warm session this adapter exists
- *  to keep. So this must sit far ABOVE any healthy hop2 — a live account
- *  measured 8–15s on a thinking-tier model — and only catch runaway tails.
- *  Using it as a normal-turn optimisation is a trap: at 8s every turn tripped it
- *  and the warm session was never reused.
- *
- *  0 disables the early end entirely (pure protocol behaviour). */
-function antigravityPostReplyGraceMs(): number {
-  const raw = process.env.CUMORA_AGY_POST_REPLY_GRACE_MS
-  if (raw == null || raw.trim() === '') return 60_000
-  const n = Number(raw)
-  return Number.isFinite(n) && n >= 0 ? n : 60_000
-}
-
 /** Re-inline the full standing prompt every N turns. `agy` exposes no
  *  system-prompt file, so turn 1 carries it inline; keeping it out of turns
  *  2..N is what stops a persistent transcript from growing by a whole standing
@@ -5673,9 +5639,6 @@ class AntigravitySession implements EngineSession {
   private standingDelivered: boolean
   /** Turns completed since the standing prompt was last inlined. */
   private standingTurns = 0
-  /** A `cumora reply`/`send` this turn actually landed. */
-  private replySent = false
-  private replyGrace: NodeJS.Timeout | null = null
 
   constructor(
     command: string,
@@ -5724,8 +5687,6 @@ class AntigravitySession implements EngineSession {
     // daemon.turnPrompt), so an inlined standing prompt is about to enter the
     // transcript. Remember it on a SUCCESSFUL write only.
     const inlinedStanding = !this.standingDelivered
-    this.replySent = false
-    this.clearReplyGrace()
     this.tracker.beginTurn()
     return new Promise((resolve) => {
       this.pending = { resolve }
@@ -5741,31 +5702,8 @@ class AntigravitySession implements EngineSession {
     })
   }
 
-  /** The daemon saw a `cumora reply`/`send` succeed this turn: the message is
-   *  out, so only agy's summary hop remains. Bound it instead of letting it hold
-   *  the session (and every queued ping) hostage. */
-  noteReplyDelivered(): void {
-    if (!this.pending || this.replySent) return
-    this.replySent = true
-    const grace = antigravityPostReplyGraceMs()
-    if (grace <= 0) return
-    this.replyGrace = setTimeout(() => {
-      this.replyGrace = null
-      if (!this.pending) return
-      this.finishTurnEarly(`reply already delivered — ending agy's post-tool summary hop after ${grace}ms`)
-    }, grace)
-    this.replyGrace.unref?.()
-  }
-
   steer(_text: string): void {
     if (!this.pending) return
-    // Once the reply is out there is nothing left to steer into: the only work
-    // remaining is a summary hop the user never reads. End it now so the daemon's
-    // coalesced rerun answers the ping immediately instead of waiting the tail out.
-    if (this.replySent) {
-      this.finishTurnEarly('a ping arrived after the reply landed — ending the tail so the rerun answers it now')
-      return
-    }
     // The documented protocol requires waiting for a result before the next
     // user event. Queueing mid-turn would be an undocumented race; the daemon's
     // normal coalesced wake delivers the ping after this turn instead.
@@ -5773,7 +5711,6 @@ class AntigravitySession implements EngineSession {
   }
 
   stop(options: { force?: boolean } = {}): Promise<void> {
-    this.clearReplyGrace()
     this.exited = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
     if (options.force) return terminateEngineTree(this.child, true)
@@ -5784,33 +5721,6 @@ class AntigravitySession implements EngineSession {
       })()
     }
     return this.stopPromise
-  }
-
-  /** Complete the turn WITHOUT agy's terminal `result`, then reap the process.
-   *  Only safe once the turn's user-visible effect already happened (the reply
-   *  landed), so the missing summary cannot lose work. The conversation id is
-   *  persisted by the daemon and the next wake resumes it via `--conversation`. */
-  private finishTurnEarly(detail: string): void {
-    if (!this.pending) return
-    this.opts.onLog(`[antigravity] ${detail}`)
-    const result: EngineRunResult = {
-      exitCode: 0,
-      sessionId: this.tracker.sessionId,
-      usage: this.tracker.partialUsage(),
-      model: this.tracker.model,
-    }
-    this.clearReplyGrace()
-    // Flip `exited` BEFORE settling so the close handler's die() finds no pending
-    // turn and stays silent — no spurious failure, no retry of a delivered reply.
-    this.exited = true
-    this.settle(result)
-    void terminateEngineTree(this.child, true)
-  }
-
-  private clearReplyGrace(): void {
-    if (!this.replyGrace) return
-    clearTimeout(this.replyGrace)
-    this.replyGrace = null
   }
 
   private onStdout(buf: Buffer): void {
@@ -5872,7 +5782,6 @@ class AntigravitySession implements EngineSession {
     const pending = this.pending
     if (!pending) return
     this.pending = null
-    this.clearReplyGrace()
     if (this.standingDelivered) {
       this.standingTurns += 1
       if (this.standingTurns >= ANTIGRAVITY_STANDING_REFRESH_TURNS) {

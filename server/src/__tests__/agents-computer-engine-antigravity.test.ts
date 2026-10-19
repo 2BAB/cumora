@@ -12,7 +12,8 @@ import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { detectEngines, getAdapter, type EngineHopReport } from '../agents/computer/engine.js'
+import { AgentRunner } from '../agents/computer/daemon.js'
+import { detectEngines, getAdapter, type EngineHopReport, type EngineSession } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -42,15 +43,26 @@ rl.on('line', (line) => {
   const content = event?.message?.content || ''
   if (log) fs.appendFileSync(log, JSON.stringify({ type: 'prompt', event }) + '\\n')
   turn += 1
-  // The post-reply summary hop: agy keeps working after the tool result and
-  // never emits a terminal result event here, which is exactly the window the
-  // daemon bounds once the reply has landed.
-  if (process.env.FAKE_AGY_SCENARIO === 'stall') {
+  if (process.env.FAKE_AGY_SCENARIO === 'reply-then-work') {
     out({ event: 'step_update', step_update: {
-      conversation_id: 'agy-conversation-1', step_index: turn, state: 'DONE', step_type: 'agent_response',
-      text_delta: 'partial summary',
+      step_index: 1, state: 'DONE', step_type: 'agent_response',
       usage: { input_tokens: 100, output_tokens: 10, thinking_tokens: 4, cache_read_tokens: 40, total_tokens: 110 },
     } })
+    out({ event: 'step_update', step_update: {
+      step_index: 2, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_tests',
+    } })
+    // The test releases the real work only after the reply and any notification.
+    const work = setInterval(() => {
+      if (!fs.existsSync(process.env.FAKE_AGY_FINISH)) return
+      clearInterval(work)
+      out({ event: 'step_update', step_update: {
+        step_index: 2, state: 'DONE', step_type: 'tool', tool_info: { name: 'run_tests' },
+      } })
+      out({ event: 'result', result: {
+        conversation_id: 'agy-conversation-1', status: 'SUCCESS', response: 'work completed',
+        usage: { input_tokens: 100, output_tokens: 10, thinking_tokens: 4, cache_read_tokens: 40, total_tokens: 110 },
+      } })
+    }, 10)
     return
   }
   if (process.env.FAKE_AGY_SCENARIO === 'error') {
@@ -126,6 +138,10 @@ async function fixture(scenario = 'ok'): Promise<Fixture> {
   const fake = join(binDir, 'agy')
   await writeFile(fake, FAKE_AGY, 'utf8')
   await chmod(fake, 0o755)
+  if (IS_WIN) {
+    await writeFile(join(binDir, 'agy.cmd'), `@echo off\r\n"${process.execPath}" "%~dp0agy" %*\r\n`, 'utf8')
+  }
+  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
   return {
     root, home, log,
     env: {
@@ -133,6 +149,7 @@ async function fixture(scenario = 'ok'): Promise<Fixture> {
       PATH: `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`,
       FAKE_AGY_LOG: log,
       FAKE_AGY_SCENARIO: scenario,
+      FAKE_AGY_FINISH: join(root, 'work-finished'),
     },
   }
 }
@@ -152,7 +169,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 4_000): Promise<voi
   }
 }
 
-test('antigravity persistent session uses auto stream-json without inner --sandbox and bills per-turn deltas', { skip: IS_WIN }, async () => {
+test('antigravity persistent session uses auto stream-json without inner --sandbox and bills per-turn deltas', async () => {
   const f = await fixture()
   const hops: EngineHopReport[] = []
   const session = getAdapter('antigravity').startSession?.({
@@ -200,7 +217,7 @@ test('antigravity persistent session uses auto stream-json without inner --sandb
   assert.deepEqual(prompts.map((record) => record.event.message.content), ['first prompt', 'second prompt'])
 })
 
-test('antigravity resumed session passes --conversation and bills step usage without historical double-charging', { skip: IS_WIN }, async () => {
+test('antigravity resumed session passes --conversation and bills step usage without historical double-charging', async () => {
   const f = await fixture('resume-history')
   const hops: EngineHopReport[] = []
   const logs: string[] = []
@@ -240,7 +257,7 @@ test('antigravity resumed session passes --conversation and bills step usage wit
   assert.equal(start.argv[start.argv.indexOf('--conversation') + 1], 'agy-conversation-resumed')
 })
 
-test('antigravity keeps its usage baseline across a result that reports no usage', { skip: IS_WIN }, async () => {
+test('antigravity keeps its usage baseline across a result that reports no usage', async () => {
   const f = await fixture('usage-gap')
   const hops: EngineHopReport[] = []
   const session = getAdapter('antigravity').startSession?.({
@@ -276,7 +293,7 @@ test('antigravity keeps its usage baseline across a result that reports no usage
   assert.deepEqual(hops.map((hop) => hop.usage), [first.usage, third.usage])
 })
 
-test('antigravity classify runs in plan mode with --sandbox and honors CUMORA_TRIAGE_MODEL', { skip: IS_WIN }, async () => {
+test('antigravity classify runs in plan mode with --sandbox and honors CUMORA_TRIAGE_MODEL', async () => {
   const f = await fixture()
   process.env.CUMORA_TRIAGE_MODEL = 'Gemini 3.5 Flash (Low)'
   const result = await getAdapter('antigravity').classify({
@@ -294,7 +311,7 @@ test('antigravity classify runs in plan mode with --sandbox and honors CUMORA_TR
   assert.equal(start.argv[start.argv.indexOf('--model') + 1], 'Gemini 3.5 Flash (Low)')
 })
 
-test('antigravity failed result surfaces its reason and still reports spent usage', { skip: IS_WIN }, async () => {
+test('antigravity failed result surfaces its reason and still reports spent usage', async () => {
   const f = await fixture('error')
   const result = await getAdapter('antigravity').run({
     home: f.home,
@@ -308,7 +325,7 @@ test('antigravity failed result surfaces its reason and still reports spent usag
   assert.deepEqual(result.usage, { input_tokens: 10, output_tokens: 0, cache_read_input_tokens: 0 })
 })
 
-test('antigravity seedHome writes AGENTS.md and native workspace skills', { skip: IS_WIN }, async () => {
+test('antigravity seedHome writes AGENTS.md and native workspace skills', async () => {
   const f = await fixture()
   await getAdapter('antigravity').seedHome(f.home, {
     id: 'agy-reviewer', name: 'Aster', role: 'Reviewer', systemPrompt: 'Review independently.',
@@ -320,7 +337,7 @@ test('antigravity seedHome writes AGENTS.md and native workspace skills', { skip
   assert.ok(existsSync(join(f.home, '.agents', 'skills')))
 })
 
-test('antigravity is detected through the agy binary on PATH', { skip: IS_WIN }, async () => {
+test('antigravity is detected through the agy binary on PATH', async () => {
   const f = await fixture()
   const old = process.env.PATH
   process.env.PATH = f.env.PATH
@@ -331,7 +348,7 @@ test('antigravity is detected through the agy binary on PATH', { skip: IS_WIN },
   }
 })
 
-test('antigravity inlines the standing prompt once, then only the delta rides each wake', { skip: IS_WIN }, async () => {
+test('antigravity inlines the standing prompt once, then only the delta rides each wake', async () => {
   const f = await fixture()
   const session = getAdapter('antigravity').startSession?.({
     home: f.home,
@@ -350,7 +367,7 @@ test('antigravity inlines the standing prompt once, then only the delta rides ea
   await session.stop()
 })
 
-test('antigravity resumed conversation already carries the standing prompt', { skip: IS_WIN }, async () => {
+test('antigravity resumed conversation already carries the standing prompt', async () => {
   const f = await fixture('resume-history')
   const session = getAdapter('antigravity').startSession?.({
     home: f.home,
@@ -363,76 +380,65 @@ test('antigravity resumed conversation already carries the standing prompt', { s
   await session.stop()
 })
 
-test('antigravity ends the post-reply summary hop after the grace and still bills the partial hop', { skip: IS_WIN }, async () => {
-  const f = await fixture('stall')
-  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '20'
-  const logs: string[] = []
-  const session = getAdapter('antigravity').startSession?.({
-    home: f.home,
-    env: f.env,
-    onLog: (line) => logs.push(line),
+for (const notice of ['grace elapsed', 'group notice', 'direct ping'] as const) {
+  test(`antigravity keeps working after a progress reply and ${notice}`, { timeout: 10_000 }, async (t) => {
+    const f = await fixture('reply-then-work')
+    process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = notice === 'grace elapsed' ? '20' : '0'
+    const logs: string[] = []
+    const hops: EngineHopReport[] = []
+    const session = getAdapter('antigravity').startSession?.({
+      home: f.home, env: f.env,
+      onLog: (line) => logs.push(line),
+      onHopUsage: (hop) => hops.push(hop),
+    })
+    assert.ok(session)
+    t.after(() => session.stop({ force: true }))
+    const steer = t.mock.method(session, 'steer')
+
+    const runner = new AgentRunner(
+      { serverUrl: 'https://server.example.test', computerId: 'fixture', deviceToken: 'fixture' },
+      { id: 'agy-fixture', name: 'Fixture', role: null, systemPrompt: null, engine: 'antigravity', model: null, fastModel: null },
+      'antigravity',
+    ) as unknown as {
+      engineSession: EngineSession
+      ensureToken(): Promise<string>
+      invokeRuntimeCli(argv: string[], signal: AbortSignal): Promise<{ exitCode?: number }>
+      maybeSteer(convo: string): Promise<void>
+    }
+    runner.engineSession = session
+    t.mock.method(runner, 'ensureToken', async () => 'fixture-token')
+    t.mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0]) => String(url).endsWith('/runtime/cli')
+      ? Response.json({ text: 'sent', exitCode: 0 })
+      : Response.json({ rows: [{
+        id: 'message-2', conversation_id: 'room', conversation_kind: 'group',
+        author_kind: notice === 'direct ping' ? 'human' : 'agent', body: 'new activity',
+      }] }))
+
+    let settled = false
+    const turn = session.send('send a progress reply, then finish the tests').then((result) => {
+      settled = true
+      return result
+    })
+    await waitFor(() => logs.includes('[antigravity] tool run_tests'))
+    const reply = await runner.invokeRuntimeCli(['reply', 'room', 'tests are running'], new AbortController().signal)
+    assert.equal(reply.exitCode, 0)
+    if (notice !== 'grace elapsed') {
+      await runner.maybeSteer('room')
+      assert.equal(steer.mock.callCount(), 1, 'the daemon must deliver the notification to the live session')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    assert.equal(settled, false, 'a progress reply must not complete an unfinished turn')
+    assert.equal(session.alive, true, 'ongoing tool work must not be killed')
+
+    await writeFile(f.env.FAKE_AGY_FINISH!, 'done')
+    const result = await turn
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.sessionId, 'agy-conversation-1')
+    assert.deepEqual(result.usage, { input_tokens: 60, output_tokens: 10, cache_read_input_tokens: 40 })
+    assert.equal(hops.length, 1)
+    assert.deepEqual(hops[0].usage, result.usage)
+    assert.equal(hops[0].toolUses, 1, 'the ongoing tool must complete before the turn finishes')
+    assert.equal(session.alive, true, 'the completed session stays warm for the next wake')
+    await session.stop()
   })
-  assert.ok(session)
-
-  // The fake never emits `result` — agy is still in its summary hop. Once the
-  // reply landed, that hop is pure dead time and must not hold the session.
-  const turn = session.send('reply then stall')
-  // A real reply lands long after agy's init event; wait for the conversation id
-  // the session persists so the early end can hand it to the next wake.
-  await waitFor(() => session.sessionId !== null)
-  session.noteReplyDelivered?.()
-  const result = await turn
-
-  assert.equal(result.exitCode, 0, 'an early end is a completed turn, not a failure')
-  assert.equal(result.error, undefined)
-  assert.equal(result.sessionId, 'agy-conversation-1', 'the conversation id must survive so the next wake resumes it')
-  assert.deepEqual(result.usage, { input_tokens: 60, output_tokens: 10, cache_read_input_tokens: 40 })
-  assert.equal(session.alive, false, 'the stalled process is reaped instead of lingering')
-  assert.ok(logs.some((line) => line.includes('reply already delivered')))
-  await session.stop({ force: true })
-})
-
-test('antigravity answers a ping that lands after the reply by ending the tail immediately', { skip: IS_WIN }, async () => {
-  const f = await fixture('stall')
-  // Grace 0 disables the timer: only the steer path can finish this turn, which
-  // is exactly the behaviour under test.
-  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '0'
-  const session = getAdapter('antigravity').startSession?.({
-    home: f.home,
-    env: f.env,
-    onLog: () => {},
-  })
-  assert.ok(session)
-
-  const turn = session.send('reply then a teammate pings')
-  await waitFor(() => session.sessionId !== null)
-  session.noteReplyDelivered?.()
-  session.steer('a teammate pinged you')
-  const result = await turn
-
-  assert.equal(result.exitCode, 0)
-  assert.equal(result.sessionId, 'agy-conversation-1')
-  assert.equal(session.alive, false, 'the rerun picks the ping up on a resumed conversation')
-  await session.stop({ force: true })
-})
-
-test('antigravity keeps its tail when no reply landed (steer stays a logged no-op)', { skip: IS_WIN }, async () => {
-  const f = await fixture()
-  process.env.CUMORA_AGY_POST_REPLY_GRACE_MS = '20'
-  const logs: string[] = []
-  const session = getAdapter('antigravity').startSession?.({
-    home: f.home,
-    env: f.env,
-    onLog: (line) => logs.push(line),
-  })
-  assert.ok(session)
-
-  const turn = session.send('a turn with no reply tool call')
-  session.steer('group noise')
-  const result = await turn
-
-  assert.equal(result.exitCode, 0)
-  assert.equal(session.alive, true, 'nothing was delivered, so the running turn is left alone')
-  assert.ok(logs.some((line) => line.includes('same-turn steer is not supported')))
-  await session.stop()
-})
+}

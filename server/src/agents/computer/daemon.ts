@@ -2225,28 +2225,16 @@ export class AgentRunner {
         return { exitCode: 70, error: `HTTP ${res.status} ${body.slice(0, 200)}`.trim() }
       }
       const data = await res.json() as { text?: unknown; exitCode?: unknown }
-      const text = typeof data.text === 'string' ? data.text : ''
-      const exitCode = typeof data.exitCode === 'number' ? data.exitCode : 0
-      if (exitCode === 0) this.noteEngineReplyDelivered(argv, text)
-      return { text, exitCode }
+      return {
+        text: typeof data.text === 'string' ? data.text : '',
+        exitCode: typeof data.exitCode === 'number' ? data.exitCode : 0,
+      }
     } catch (err) {
       return { exitCode: 70, error: err instanceof Error ? err.message : String(err) }
     } finally {
       clearTimeout(timeout)
       lifecycleSignal.removeEventListener('abort', onLifecycleAbort)
     }
-  }
-
-  /** Forward a LANDED reply to the live engine session. This is the turn's
-   *  user-visible effect: an engine with a post-tool summary hop (agy) can bound
-   *  how long it keeps the session locked after the message is already out.
-   *  A HELD response is NOT a delivery — the reply was withheld and the turn
-   *  still has real work (re-compose), so it must keep its normal tail. */
-  private noteEngineReplyDelivered(argv: string[], text: string): void {
-    const command = argv[0]
-    if (command !== 'reply' && command !== 'send') return
-    if (/NOT sent/i.test(text)) return
-    try { this.engineSession?.noteReplyDelivered?.() } catch { /* observability only */ }
   }
 
   /** Env handed to the engine subprocess. Secure mode preserves the operator's
@@ -2697,15 +2685,10 @@ export class AgentRunner {
       // coordinates identically to the cloud pod-agent.
       GLANCE_YIELD_RULES + `\n\n` +
       postingMechanicsText(this.promptSurface()) +
-      // Two cost rules discovered on live `agy` runs:
-      //  1. The reply tool IS the deliverable. Anything the model writes after it
-      //     returns is a summary nobody reads, but the engine still spends a full
-      //     model hop on it while the session stays locked.
-      //  2. agy's command-safety monitor flags shell-operator-shaped commands
-      //     (`unquoted_shell_operators`) and re-reviews every one of them with a
-      //     small model — ~1.5s per `cumora` call, on the critical path of a reply.
-      `Once a \`cumora reply\` / \`send\` returns success the message is already delivered — ` +
-      `end the turn there. Do NOT restate it, summarise it, or narrate what you just did. ` +
+      `After your work is complete and your final \`cumora reply\` returns success, end the turn. ` +
+      `Do NOT restate it, summarise it, or narrate what you just did. ` +
+      `A progress update or a brief reply to a mid-task ping does not complete your task — continue the work. ` +
+      // agy's command-safety monitor re-reviews shell operators on each call.
       `Keep each \`cumora\` call a SINGLE fully quoted command with no pipes, \`&&\`, or redirection. ` +
       `When you're answering a ` +
       `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
