@@ -97,6 +97,11 @@ rl.on('line', (line) => {
     }
   } else if (msg.method === 'session/prompt') {
     prompts += 1
+    if (mode === 'session-gone-after-first' && prompts >= 2) {
+      // The turn began without a resume, so the resumed flag is already false.
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: 'Session is not owned by this ACP connection' } })
+      return
+    }
     if (mode === 'die-mid-turn') {
       process.exit(17)
     }
@@ -118,10 +123,12 @@ rl.on('line', (line) => {
     }
     if (mode === 'ask-permission') {
       pendingPrompt = { id: msg.id, sid: msg.params.sessionId }
-      // Deliberately use id: 1 to verify server->client requests do not collide with client waiters.
+      // Deliberately reuse the pending prompt's own id: a server->client request
+      // must be routed by method, never by id, or it would be delivered as the
+      // prompt's response.
       send({
         jsonrpc: '2.0',
-        id: 1,
+        id: msg.id,
         method: 'session/request_permission',
         params: {
           sessionId: msg.params.sessionId,
@@ -139,7 +146,7 @@ rl.on('line', (line) => {
       pendingPrompt = { id: msg.id, sid: msg.params.sessionId }
       send({
         jsonrpc: '2.0',
-        id: 1,
+        id: msg.id,
         method: 'session/request_permission',
         params: {
           sessionId: msg.params.sessionId,
@@ -297,6 +304,29 @@ test('maka uses session/resume when resumeSessionId is supplied and ignores non-
   assert.deepEqual(calls.slice(0, 2).map((c) => c.method), ['initialize', 'session/resume'])
 })
 
+test('maka still recovers when the session disappears after a successful turn', async () => {
+  const f = await makeFixture('session-gone-after-first')
+  const session = getAdapter('maka').startSession?.({
+    home: f.home,
+    env: f.env,
+    standingPrompt: null,
+    resumeSessionId: 'maka-sess-existing',
+    onLog: () => {},
+  })
+  assert.ok(session)
+  liveSessions.push(session)
+
+  // The first turn succeeds, which clears `resumed` on the connection.
+  const first = await session.send('first turn')
+  assert.equal(first.exitCode, 0)
+
+  // The backend loses the session afterwards. Without classifying Maka's own
+  // wording independently of `resumed`, this reads as an unknown error and
+  // recovery never happens.
+  const second = await session.send('second turn')
+  assert.equal(second.failure?.kind, 'resume-not-found')
+})
+
 test('maka auto-answers server-initiated session/request_permission requests and cancels when no allow option exists', async () => {
   const f = await makeFixture('ask-permission')
   const session = getAdapter('maka').startSession?.({
@@ -313,7 +343,10 @@ test('maka auto-answers server-initiated session/request_permission requests and
   assert.equal(r.exitCode, 0)
 
   const calls = await f.readCalls()
-  const reply = calls.find((c) => c.id === 1 && !c.method)
+  const promptCall = calls.find((c) => c.method === 'session/prompt')
+  const reply = calls.find((c) => c.id === promptCall?.id && !c.method)
+  // Same id as the outstanding prompt: routing by id would have been wrong.
+  assert.equal(reply?.id, promptCall?.id)
   assert.deepEqual(reply?.result, {
     outcome: { outcome: 'selected', optionId: '550e8400-e29b-41d4-a716-446655440002' },
   })
@@ -333,7 +366,9 @@ test('maka auto-answers server-initiated session/request_permission requests and
   assert.equal(r2.exitCode, 0)
 
   const callsRejectOnly = await fRejectOnly.readCalls()
-  const replyRejectOnly = callsRejectOnly.find((c) => c.id === 1 && !c.method)
+  const promptCallRejectOnly = callsRejectOnly.find((c) => c.method === 'session/prompt')
+  const replyRejectOnly = callsRejectOnly.find((c) => c.id === promptCallRejectOnly?.id && !c.method)
+  assert.equal(replyRejectOnly?.id, promptCallRejectOnly?.id)
   assert.deepEqual(replyRejectOnly?.result, {
     outcome: { outcome: 'cancelled' },
   })

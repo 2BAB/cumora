@@ -3606,10 +3606,15 @@ class MakaSession implements EngineSession {
   }
 
   private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    // The wording is Maka's own and unambiguous, so it classifies whether or not
+    // this turn began as a resume. Gating it on `resumed` let a session that
+    // disappeared AFTER a successful turn fall through as an unknown error,
+    // skipping recovery and leaving the connection on a stale session id.
+    const missingSession = MAKA_MISSING_SESSION_RE.test(message)
     return classifyEngineResult({
       exitCode,
       error: message,
-      failure: wasResume && MAKA_MISSING_SESSION_RE.test(message)
+      failure: missingSession
         ? { kind: 'resume-not-found', message, diagnostic: message }
         : undefined,
       sessionId: this.conn.sid,
